@@ -4,7 +4,26 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Paper](https://img.shields.io/badge/Paper-ACL%202026%20Demo-blue)](https://openreview.net/group?id=aclweb.org/ACL/2026/Demo)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
+
+---
+
+<p align="center">
+  <a href="https://drive.google.com/file/d/1wbS2rYpeomiFlaY_8VEA7Z53WO99HD_d/view?usp=drive_link">
+    <img src="https://img.shields.io/badge/%E2%96%B6%EF%B8%8F_Watch_Demo_Video-red?style=for-the-badge&logoColor=white&logo=googledrive" alt="Watch Demo Video" height="40"/>
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://drive.google.com/file/d/1wbS2rYpeomiFlaY_8VEA7Z53WO99HD_d/view?usp=drive_link">
+    <picture>
+      <img src="figures/thumbnail.png" alt="PromptMOO Demo Video — Click to Watch" width="800"/>
+    </picture>
+  </a>
+  <br/>
+  <sub><b>Click the image above to watch the demo video (2.5 min)</b></sub>
+</p>
 
 ---
 
