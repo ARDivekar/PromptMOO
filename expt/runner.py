@@ -97,6 +97,7 @@ def create_task_llm(*, llm: str, api_key: str, limits: Optional[Any] = None):
             "call_llm": [
                 ValueError,
                 asyncio.TimeoutError,
+                litellm.Timeout,
                 litellm.APIError,
                 litellm.RateLimitError,
                 litellm.ServiceUnavailableError,
@@ -139,6 +140,7 @@ def create_optimizer_llm(
             "call_llm": [
                 ValueError,
                 asyncio.TimeoutError,
+                litellm.Timeout,
                 litellm.APIError,
                 litellm.RateLimitError,
                 litellm.ServiceUnavailableError,
@@ -181,6 +183,7 @@ def create_gradient_llm(
             "call_llm": [
                 ValueError,
                 asyncio.TimeoutError,
+                litellm.Timeout,
                 litellm.APIError,
                 litellm.RateLimitError,
                 litellm.ServiceUnavailableError,
@@ -221,6 +224,7 @@ def create_loss_llm(*, llm: str, api_key: str, limits: Optional[BaseLimitSet] = 
             "call_llm": [
                 ValueError,
                 asyncio.TimeoutError,
+                litellm.Timeout,
                 litellm.APIError,
                 litellm.RateLimitError,
                 litellm.ServiceUnavailableError,
