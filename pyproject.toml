@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "expt"]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring real API calls (may cost $)",
+    "unit: marks pure unit tests (no network)",
+]
+timeout = 120
+timeout_method = "thread"
