@@ -1,17 +1,53 @@
 import asyncio
-import json, os
+import json
+import os
+import random
+
+# Disable litellm's background LoggingWorker entirely.
+# litellm (<=1.78) has a GLOBAL_LOGGING_WORKER singleton with an asyncio.Queue
+# that gets bound to the first event loop that touches it. When multiple
+# AlgorithmRunner threads each spin up their own event loops (for SlowBurnLLM),
+# the Queue raises "bound to a different event loop" from the second thread on.
+# See: https://github.com/BerriAI/litellm/issues/17813
+#      https://github.com/BerriAI/litellm/issues/14521
+#
+# Replacing the module-level GLOBAL_LOGGING_WORKER variable is NOT sufficient
+# because litellm.utils and litellm.caching.caching_handler both do
+# `from ... import GLOBAL_LOGGING_WORKER` at import time, holding their own
+# stale reference. The only fix that reaches all call sites is to patch the
+# CLASS METHOD so every instance (past and future) becomes a no-op.
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import litellm
-from concurry import CallLimit, LimitSet, RateLimit, RetryAlgorithm, Worker
+from concurry import CallLimit, LimitSet, RateLimit, ResourceLimit, Worker
 from concurry.core.limit.limit_set import BaseLimitSet
 from morphic import validate
 from morphic.typed import format_exception_msg
+from slowburn import SlowBurnLLM
+
+warnings.filterwarnings(
+    "ignore", message="coroutine .* was never awaited", category=RuntimeWarning
+)
+
+try:
+    from litellm.litellm_core_utils.logging_worker import LoggingWorker
+
+    def _noop_enqueue(self, coroutine=None, async_coroutine=None):
+        coro = coroutine or async_coroutine
+        if coro is not None:
+            coro.close()
+
+    LoggingWorker.ensure_initialized_and_enqueue = _noop_enqueue
+    LoggingWorker.start = lambda self: None
+    LoggingWorker.enqueue = _noop_enqueue
+except (ImportError, AttributeError):
+    pass
 
 from prompt_moo.algorithm import GPO, OPRO, TextGrad
+from prompt_moo.config import promptmoo_config
 from prompt_moo.data_input import Dataset
 from prompt_moo.data_structures import Task
-from prompt_moo.llm_workers import LLM
 from prompt_moo.prompt_template_utils import PromptTemplate
 from prompt_moo.task_predictor import parse_task_response
 
@@ -25,49 +61,228 @@ def parse_task_response_retry_until(result: str, **context) -> bool:
         return False
 
 
-# LLM configuration mapping
 LLM_CONFIGS = {
     "llama3.1": {
-        "task_model": "meta-llama/llama-3.1-8b-instruct",
-        "other_model": "meta-llama/llama-3.1-70b-instruct",
+        "task_model": "openrouter/meta-llama/llama-3.1-8b-instruct",
+        "other_model": "openrouter/meta-llama/llama-3.1-70b-instruct",
+        "reasoning": False,
         "provider_order": {
-            "meta-llama/llama-3.1-8b-instruct": ["novita/fp8", "nebius/fp8", "deepinfra/bf16", "nebius/fast",],
-            "meta-llama/llama-3.1-70b-instruct": ["novita/fp8", "nebius/fp8", "deepinfra/bf16", "nebius/fast",],
-        }
+            "openrouter/meta-llama/llama-3.1-8b-instruct": [
+                "novita/fp8",
+                "nebius/fp8",
+                "deepinfra/bf16",
+                "nebius/fast",
+            ],
+            "openrouter/meta-llama/llama-3.1-70b-instruct": [
+                "novita/fp8",
+                "nebius/fp8",
+                "deepinfra/bf16",
+                "nebius/fast",
+            ],
+        },
+    },
+    "qwen3.5": {
+        "task_model": "openrouter/qwen/qwen3.5-9b",
+        "other_model": "openrouter/qwen/qwen3.5-397b-a17b",
+        "reasoning": False,
+        "provider_order": {
+            "openrouter/qwen/qwen3.5-9b": ["venice/fp8", "together"],
+            "openrouter/qwen/qwen3.5-397b-a17b": [
+                "atlas-cloud/fp8",
+                "parasail/fp8",
+                "alibaba",
+                "novita",
+                "together",
+            ],
+        },
     },
     "qwen3": {
-        "task_model": "qwen/qwen3-8b",
-        "other_model": "qwen/qwen3-vl-235b-a22b-thinking",
-        "provider_order" : {
-            "qwen/qwen3-8b": ["novita/fp8", "fireworks"],
-            "qwen/qwen3-vl-235b-a22b-thinking": ["novita/fp8", "fireworks"],
-        }
-    },
-    "gpt4.1": {
-        "task_model": "openai/gpt-4.1-nano",
-        "other_model": "openai/gpt-4.1",
+        "task_model": "openrouter/qwen/qwen3-8b",
+        "other_model": "openrouter/qwen/qwen3-235b-a22b-2507",
+        "reasoning": False,
         "provider_order": {
-            "openai/gpt-4.1-nano": ["openai", "azure"],
-            "openai/gpt-4.1": ["openai", "azure"],
-        }
+            "openrouter/qwen/qwen3-8b": ["alibaba", "atlas-cloud/fp8"],
+            "openrouter/qwen/qwen3-235b-a22b-2507": [
+                "google-vertex",
+                "parasail/fp8",
+                "alibaba",
+                "wandb/bf16",
+                "together",
+                "atlas-cloud/fp8",
+                "novita/fp8",
+                "friendli",
+            ],
+        },
+    },
+    "gpt5": {
+        "task_model": "openrouter/openai/gpt-5-nano",
+        "other_model": "openrouter/openai/gpt-5.2",
+        "reasoning": False,
+        "provider_order": {
+            "openrouter/openai/gpt-5-nano": ["openai", "azure"],
+            "openrouter/openai/gpt-5.2": ["openai", "azure"],
+        },
+    },
+    "claude4.5": {
+        "task_model": "openrouter/anthropic/claude-haiku-4.5",
+        "other_model": "openrouter/anthropic/claude-sonnet-4.5",
+        "reasoning": False,
+        "provider_order": {
+            "openrouter/anthropic/claude-haiku-4.5": [
+                "google-vertex",
+                "anthropic",
+                "amazon-bedrock",
+            ],
+            "openrouter/anthropic/claude-sonnet-4.5": [
+                "google-vertex/global",
+                "google-vertex",
+                "anthropic",
+                "amazon-bedrock",
+            ],
+        },
     },
 }
+
+REASONING_EXTRA_TOKENS = 2000
+
+QWEN_NO_THINK_SUFFIX = "\n/no_think"
+
+
+def _detect_reasoning_family(model_name: str) -> Optional[str]:
+    """Detect the reasoning parameter family from the model name."""
+    if "/qwen/" in model_name:
+        return "qwen"
+    if "/openai/" in model_name:
+        return "openai"
+    if "/anthropic/" in model_name:
+        return "anthropic"
+    return None
+
+
+def _build_litellm_params(
+    *,
+    providers: Optional[List[str]],
+    model_name: str,
+    reasoning: bool,
+) -> Dict[str, Any]:
+    """Build the litellm_params dict with provider prefs and reasoning config.
+
+    For Qwen models with reasoning disabled, we send three complementary signals:
+    1. ``enable_thinking: false`` as a top-level extra_body param (OpenRouter native).
+    2. ``chat_template_kwargs: {"enable_thinking": false}`` for vLLM/TGI backends.
+    3. ``litellm.drop_params = True`` is already set in SlowBurnLLM, so providers
+       that don't recognize these params will silently ignore them.
+
+    Args:
+        providers: Provider order list for OpenRouter routing.
+        model_name: Full litellm model identifier (used to detect family).
+        reasoning: Whether to enable reasoning/thinking.
+    """
+    extra_body: Dict[str, Any] = {}
+
+    if providers is not None:
+        ## Shuffle the providers list
+        random.shuffle(providers)
+        extra_body["provider"] = {"order": providers, "allow_fallbacks": True}
+
+    family = _detect_reasoning_family(model_name)
+
+    if family == "qwen":
+        extra_body["enable_thinking"] = reasoning
+        extra_body["chat_template_kwargs"] = {"enable_thinking": reasoning}
+    elif family == "openai":
+        extra_body["reasoning"] = {"effort": "medium" if reasoning else "none"}
+    elif family == "anthropic":
+        extra_body["reasoning"] = {"effort": "medium" if reasoning else "none"}
+
+    if len(extra_body) == 0:
+        return {}
+    return {"extra_body": extra_body}
+
+
+def _get_prompt_suffix(*, model_name: str, reasoning: bool) -> str:
+    """Return a prompt suffix to append to every user message for this worker.
+
+    For Qwen models with reasoning disabled, returns the ``/no_think`` token
+    as a belt-and-suspenders complement to the API-level ``enable_thinking: false``.
+    Some OpenRouter providers ignore the API param; the in-message token is
+    always respected by the Qwen chat template.
+    """
+    if not reasoning and _detect_reasoning_family(model_name) == "qwen":
+        return QWEN_NO_THINK_SUFFIX
+    return ""
+
+
+def _stamp_prompt_suffix(llm: SlowBurnLLM, *, model_name: str, reasoning: bool) -> None:
+    """Set ``_prompt_suffix`` on a SlowBurnLLM worker instance.
+
+    Pipeline components read this via ``get_prompt_suffix(llm_pool)`` and
+    append it to every user message before calling ``call_llm_batch``.
+    """
+    suffix = _get_prompt_suffix(model_name=model_name, reasoning=reasoning)
+    object.__setattr__(llm, "_prompt_suffix", suffix)
+
+
+def get_prompt_suffix(llm_pool: Any) -> str:
+    """Read the prompt suffix stored on an LLM worker (empty string if none).
+
+    Re-exported from ``prompt_moo.llm_utils`` for convenience.
+    """
+    from prompt_moo.llm_utils import get_prompt_suffix as _get
+
+    return _get(llm_pool)
+
+
+def _build_retry_config(*, cfg: Any) -> Dict[str, Any]:
+    """Build retry config dict shared by all LLM factory functions.
+
+    Args:
+        cfg: PromptMOODefaults instance.
+
+    Returns:
+        Dict of retry-related kwargs for SlowBurnLLM.options().
+    """
+    return dict(
+        num_retries={"call_llm": cfg.num_retries, "*": 0},
+        retry_wait={"call_llm": cfg.retry_wait, "*": 1},
+        retry_algorithm={"call_llm": cfg.retry_algorithm, "*": "Exponential"},
+        retry_jitter={"call_llm": cfg.retry_jitter, "*": 0},
+        retry_on={
+            "call_llm": [
+                ValueError,
+                asyncio.TimeoutError,
+                litellm.Timeout,
+                litellm.APIError,
+                litellm.APIConnectionError,
+                litellm.BadRequestError,
+                litellm.InternalServerError,
+                litellm.RateLimitError,
+                litellm.ServiceUnavailableError,
+            ],
+            "*": [],
+        },
+    )
 
 
 def create_shared_limits() -> BaseLimitSet:
     """Create shared LimitSet for all LLM workers.
 
+    Reads capacities from promptmoo_config.defaults at call time.
+
     Returns:
         LimitSet configured for rate limiting across all LLM workers.
     """
+    cfg = promptmoo_config.defaults
     return LimitSet(
         limits=[
-            # Calls/min (Provider Limit)
-            CallLimit(window_seconds=60, capacity=500),
-            # Input tokens/min (Cost Control)
-            RateLimit(key="input_tokens", window_seconds=60, capacity=10_000_000),
-            # Output tokens/min (Cost Control)
-            RateLimit(key="output_tokens", window_seconds=60, capacity=1_000_000),
+            ResourceLimit(key="parallel_calls", capacity=cfg.max_parallel_calls),
+            CallLimit(window_seconds=60, capacity=cfg.max_rpm),
+            RateLimit(
+                key="input_tokens", window_seconds=60, capacity=cfg.max_input_tpm
+            ),
+            RateLimit(
+                key="output_tokens", window_seconds=60, capacity=cfg.max_output_tpm
+            ),
         ],
         mode="asyncio",
         shared=True,
@@ -75,171 +290,176 @@ def create_shared_limits() -> BaseLimitSet:
 
 
 @validate
-def create_task_llm(*, llm: str, api_key: str, limits: Optional[Any] = None):
-    """Create task LLM (AsyncIO worker for concurrent calls).
+def create_task_llm(
+    *, llm: str, api_key: str, limits: BaseLimitSet, reasoning: bool = False
+) -> SlowBurnLLM:
+    """Create task LLM using SlowBurnLLM.
 
     Args:
-        llm: LLM family to use. Options: "llama3.1", "qwen3", "gpt4.1"
-        api_key: API key for LLM service (required)
-        limits: Shared LimitSet for rate limiting (should be shared across all LLMs)
+        llm: LLM family key in LLM_CONFIGS.
+        api_key: API key for LLM service.
+        limits: Shared LimitSet for rate limiting.
+        reasoning: Enable reasoning/thinking mode. Adds REASONING_EXTRA_TOKENS to max_tokens.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
 
-    model_name = LLM_CONFIGS[llm]["task_model"]
-    return LLM.options(
+    cfg = promptmoo_config.defaults
+    config = LLM_CONFIGS[llm]
+    model_name = config["task_model"]
+    providers = config["provider_order"].get(model_name)
+    reasoning = config["reasoning"]
+    max_tokens = cfg.task_llm_max_tokens
+    if reasoning and _detect_reasoning_family(model_name) is not None:
+        max_tokens += REASONING_EXTRA_TOKENS
+
+    llm = SlowBurnLLM.options(
         mode="asyncio",
-        num_retries={"call_llm": 10, "*": 0},
-        retry_wait={"call_llm": 2, "*": 1},
-        retry_algorithm={"call_llm": RetryAlgorithm.Fibonacci, "*": RetryAlgorithm.Exponential},
-        retry_jitter={"call_llm": 0.3, "*": 0},
-        retry_on={
-            "call_llm": [
-                ValueError,
-                asyncio.TimeoutError,
-                litellm.Timeout,
-                litellm.APIError,
-                litellm.RateLimitError,
-                litellm.ServiceUnavailableError,
-            ],
-            "*": [],
-        },
         limits=limits,
+        **_build_retry_config(cfg=cfg),
     ).init(
         name="task_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=0.1,
-        max_tokens=256,
-        timeout=60.0,
+        temperature=cfg.task_llm_temperature,
+        max_tokens=max_tokens,
+        timeout=cfg.task_llm_timeout,
+        litellm_params=_build_litellm_params(
+            providers=providers,
+            model_name=model_name,
+            reasoning=reasoning,
+        ),
     )
+    _stamp_prompt_suffix(llm, model_name=model_name, reasoning=reasoning)
+    return llm
 
 
 @validate
 def create_optimizer_llm(
-    *, llm: str, api_key: str, limits: Optional[BaseLimitSet] = None
-):
-    """Create optimizer LLM (AsyncIO worker for concurrent calls).
+    *, llm: str, api_key: str, limits: BaseLimitSet
+) -> SlowBurnLLM:
+    """Create optimizer LLM using SlowBurnLLM.
 
     Args:
-        llm: LLM family to use. Options: "llama3.1", "qwen3", "gpt4.1"
-        api_key: API key for LLM service (required)
-        limits: Shared LimitSet for rate limiting (should be shared across all LLMs)
+        llm: LLM family key in LLM_CONFIGS.
+        api_key: API key for LLM service.
+        limits: Shared LimitSet for rate limiting.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
 
-    model_name = LLM_CONFIGS[llm]["other_model"]
-    return LLM.options(
+    cfg = promptmoo_config.defaults
+    config = LLM_CONFIGS[llm]
+    model_name = config["other_model"]
+    providers = config["provider_order"].get(model_name)
+    reasoning = config["reasoning"]
+    max_tokens = cfg.optimizer_llm_max_tokens
+    if reasoning and _detect_reasoning_family(model_name) is not None:
+        max_tokens += REASONING_EXTRA_TOKENS
+
+    llm = SlowBurnLLM.options(
         mode="asyncio",
-        num_retries={"call_llm": 10, "*": 0},
-        retry_wait={"call_llm": 2, "*": 1},
-        retry_algorithm={"call_llm": RetryAlgorithm.Fibonacci, "*": RetryAlgorithm.Exponential},
-        retry_jitter={"call_llm": 0.3, "*": 0},
-        retry_on={
-            "call_llm": [
-                ValueError,
-                asyncio.TimeoutError,
-                litellm.Timeout,
-                litellm.APIError,
-                litellm.RateLimitError,
-                litellm.ServiceUnavailableError,
-            ],
-            "*": [],
-        },
         limits=limits,
+        **_build_retry_config(cfg=cfg),
     ).init(
         name="optimizer_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=1.0,
-        max_tokens=4096,
-        timeout=600.0,
+        temperature=cfg.optimizer_llm_temperature,
+        max_tokens=max_tokens,
+        timeout=cfg.optimizer_llm_timeout,
+        litellm_params=_build_litellm_params(
+            providers=providers,
+            model_name=model_name,
+            reasoning=reasoning,
+        ),
     )
+    _stamp_prompt_suffix(llm, model_name=model_name, reasoning=reasoning)
+    return llm
 
 
 @validate
-def create_gradient_llm(
-    *, llm: str, api_key: str, limits: Optional[BaseLimitSet] = None
-):
-    """Create gradient LLM (AsyncIO worker for concurrent calls).
+def create_gradient_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurnLLM:
+    """Create gradient LLM using SlowBurnLLM.
 
     Args:
-        llm: LLM family to use. Options: "llama3.1", "qwen3", "gpt4.1"
-        api_key: API key for LLM service (required)
-        limits: Shared LimitSet for rate limiting (should be shared across all LLMs)
+        llm: LLM family key in LLM_CONFIGS.
+        api_key: API key for LLM service.
+        limits: Shared LimitSet for rate limiting.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
 
-    model_name = LLM_CONFIGS[llm]["other_model"]
-    return LLM.options(
+    cfg = promptmoo_config.defaults
+    config = LLM_CONFIGS[llm]
+    model_name = config["other_model"]
+    providers = config["provider_order"].get(model_name)
+    reasoning = config["reasoning"]
+    max_tokens = cfg.gradient_llm_max_tokens
+    if reasoning and _detect_reasoning_family(model_name) is not None:
+        max_tokens += REASONING_EXTRA_TOKENS
+
+    llm = SlowBurnLLM.options(
         mode="asyncio",
-        num_retries={"call_llm": 10, "*": 0},
-        retry_wait={"call_llm": 2, "*": 1},
-        retry_algorithm={"call_llm": RetryAlgorithm.Fibonacci, "*": RetryAlgorithm.Exponential},
-        retry_jitter={"call_llm": 0.3, "*": 0},
-        retry_on={
-            "call_llm": [
-                ValueError,
-                asyncio.TimeoutError,
-                litellm.Timeout,
-                litellm.APIError,
-                litellm.RateLimitError,
-                litellm.ServiceUnavailableError,
-            ],
-            "*": [],
-        },
         limits=limits,
+        **_build_retry_config(cfg=cfg),
     ).init(
         name="gradient_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=0.1,
-        max_tokens=2048,
-        timeout=300.0,
+        temperature=cfg.gradient_llm_temperature,
+        max_tokens=max_tokens,
+        timeout=cfg.gradient_llm_timeout,
+        litellm_params=_build_litellm_params(
+            providers=providers,
+            model_name=model_name,
+            reasoning=reasoning,
+        ),
     )
+    _stamp_prompt_suffix(llm, model_name=model_name, reasoning=reasoning)
+    return llm
 
 
 @validate
-def create_loss_llm(*, llm: str, api_key: str, limits: Optional[BaseLimitSet] = None):
-    """Create loss LLM (AsyncIO worker for concurrent calls).
+def create_loss_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurnLLM:
+    """Create loss LLM using SlowBurnLLM.
 
     Args:
-        llm: LLM family to use. Options: "llama3.1", "qwen3", "gpt4.1"
-        api_key: API key for LLM service (required)
-        limits: Shared LimitSet for rate limiting (should be shared across all LLMs)
+        llm: LLM family key in LLM_CONFIGS.
+        api_key: API key for LLM service.
+        limits: Shared LimitSet for rate limiting.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
 
-    model_name = LLM_CONFIGS[llm]["other_model"]
-    return LLM.options(
+    cfg = promptmoo_config.defaults
+    config = LLM_CONFIGS[llm]
+    model_name = config["other_model"]
+    providers = config["provider_order"].get(model_name)
+    reasoning = config["reasoning"]
+    max_tokens = cfg.loss_llm_max_tokens
+    if reasoning and _detect_reasoning_family(model_name) is not None:
+        max_tokens += REASONING_EXTRA_TOKENS
+
+    llm = SlowBurnLLM.options(
         mode="asyncio",
-        num_retries={"call_llm": 10, "*": 0},
-        retry_wait={"call_llm": 2, "*": 1},
-        retry_algorithm={"call_llm": RetryAlgorithm.Fibonacci, "*": RetryAlgorithm.Exponential},
-        retry_jitter={"call_llm": 0.3, "*": 0},
-        retry_on={
-            "call_llm": [
-                ValueError,
-                asyncio.TimeoutError,
-                litellm.Timeout,
-                litellm.APIError,
-                litellm.RateLimitError,
-                litellm.ServiceUnavailableError,
-            ],
-            "*": [],
-        },
         limits=limits,
+        **_build_retry_config(cfg=cfg),
     ).init(
         name="loss_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=0.1,
-        max_tokens=256,
-        timeout=60.0,
+        temperature=cfg.loss_llm_temperature,
+        max_tokens=max_tokens,
+        timeout=cfg.loss_llm_timeout,
+        litellm_params=_build_litellm_params(
+            providers=providers,
+            model_name=model_name,
+            reasoning=reasoning,
+        ),
     )
+    _stamp_prompt_suffix(llm, model_name=model_name, reasoning=reasoning)
+    return llm
 
 
 # Dataset configurations
@@ -247,10 +467,10 @@ DATASET_CONFIGS = {
     "SummEval": {
         "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
         "task_output_formats": {
-            "fluency": "An integer between 1 to 5",                         # "1|2|3|4|5",
-            "coherence": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "relevance": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "consistency": "An integer between 1 to 5",                     # "1|2|3|4|5",
+            "fluency": "An integer between 1 to 5",
+            "coherence": "An integer between 1 to 5",
+            "relevance": "An integer between 1 to 5",
+            "consistency": "An integer between 1 to 5",
         },
         "task_losses": {
             "fluency": "accuracy",
@@ -275,11 +495,11 @@ DATASET_CONFIGS = {
     "BRIGHTER": {
         "prompt_prefix": "Evaluate the emotion intensities in the text. Output JSON with intensity scores 0-3. Do NOT include reasoning or explanations. Each entry of anger, fear, joy, sadness, surprise should contain a single integer between 0 and 3. So entries like '0/3' or '0|3' or '0.5' are invalid.",
         "task_output_formats": {
-            "anger": "An integer between 0 to 3",                       # "0|1|2|3",
-            "fear": "An integer between 0 to 3",                        # "0|1|2|3",
-            "joy": "An integer between 0 to 3",                         # "0|1|2|3",
-            "sadness": "An integer between 0 to 3",                     # "0|1|2|3",
-            "surprise": "An integer between 0 to 3",                    # "0|1|2|3",
+            "anger": "An integer between 0 to 3",
+            "fear": "An integer between 0 to 3",
+            "joy": "An integer between 0 to 3",
+            "sadness": "An integer between 0 to 3",
+            "surprise": "An integer between 0 to 3",
         },
         "task_losses": {
             "anger": "accuracy",
@@ -313,18 +533,15 @@ def build_prompt_skeleton(
     config = DATASET_CONFIGS[dataset_name]
     prompt_prefix = config["prompt_prefix"]
 
-    # Use provided task_output_formats, or fall back to DATASET_CONFIGS
     if task_output_formats is None:
         task_output_formats = config["task_output_formats"]
 
-    # Build dynamic task list for the prompt
     task_names = [task.task_name for task in tasks]
     if len(task_names) == 1:
         task_list_str = f"Output ONLY the '{task_names[0]}' metric."
     else:
         task_list_str = f"Output the following metrics: {', '.join(task_names)}."
 
-    # Build JSON format section with only the selected tasks
     json_lines = []
     for task in tasks:
         task_name = task.task_name
@@ -337,7 +554,6 @@ def build_prompt_skeleton(
 
     json_format = "{\n" + ",\n".join(json_lines) + "\n}"
 
-    # Combine into full skeleton
     skeleton = f"""{prompt_prefix}
 {task_list_str}
 Output format (follow this EXACTLY):
@@ -356,13 +572,10 @@ def get_initial_prompt(
 ) -> PromptTemplate:
     """Get initial prompt for a dataset with specified tasks.
 
-    The prompt skeleton is dynamically generated to include only the selected tasks.
-
     Args:
         dataset_name: Name of the dataset
         tasks: List of tasks to include in the prompt
         task_output_formats: Optional dict mapping task names to output format specs.
-            If not provided, will use DATASET_CONFIGS.
 
     Returns:
         PromptTemplate configured for the specified tasks
@@ -381,25 +594,23 @@ def get_initial_prompt(
 
 
 @validate
-def get_task_losses(*, dataset_name: str, tasks: Optional[List[Task]] = None) -> Dict[str, str]:
+def get_task_losses(
+    *, dataset_name: str, tasks: Optional[List[Task]] = None
+) -> Dict[str, str]:
     """Get task losses for a dataset.
-    
+
     Args:
         dataset_name: Name of the dataset
-        tasks: Optional list of tasks to filter losses for. If None, returns all losses.
-    
+        tasks: Optional list of tasks to filter losses for.
+
     Returns:
         Dict mapping task names to loss function names
     """
     all_losses = DATASET_CONFIGS[dataset_name]["task_losses"]
-    
-    # If tasks specified, filter to only those tasks
     if tasks is not None:
         task_names = {t.task_name for t in tasks}
         return {k: v for k, v in all_losses.items() if k in task_names}
-    
     return all_losses
-
 
 
 @validate
@@ -411,15 +622,10 @@ def get_single_task_prompt(
 ) -> PromptTemplate:
     """Get initial prompt for a single task.
 
-    This is useful for running algorithms on individual tasks rather than
-    all tasks in a dataset simultaneously. The prompt skeleton will only
-    show the selected task in the JSON format section.
-
     Args:
         task: The task to create a prompt for
-        dataset_name: Name of the dataset (to get the skeleton format)
+        dataset_name: Name of the dataset
         task_output_formats: Optional dict mapping task names to output format specs.
-            If not provided, will use DATASET_CONFIGS.
 
     Returns:
         PromptTemplate configured for this single task
@@ -436,22 +642,13 @@ def get_single_task_prompt(
         tasks=[task],
     )
 
+
 def find_last_prompt(output_dir: str) -> Tuple[Optional[int], Optional[str]]:
-    """Find the latest saved prompt in an output directory.
-    
-    Iterates through step_{i}_new.txt files from i=100 down to 0 
-    and returns the step number and prompt content of the last available one.
-    
-    Args:
-        output_dir: The run output directory containing a 'prompts' subfolder
-        
-    Returns:
-        Tuple of (last_step, prompt_content) or (None, None) if no prompts found
-    """
+    """Find the latest saved prompt in an output directory."""
     prompts_dir = os.path.join(output_dir, "prompts")
     if not os.path.exists(prompts_dir):
         return None, None
-    
+
     for i in range(100, -1, -1):
         prompt_path = os.path.join(prompts_dir, f"step_{i}_new.txt")
         if os.path.exists(prompt_path):
@@ -459,24 +656,15 @@ def find_last_prompt(output_dir: str) -> Tuple[Optional[int], Optional[str]]:
                 return i, f.read()
     return None, None
 
+
 def check_run_status(output_dir: str) -> Dict[str, Any]:
-    """Check the status of a run based on its output files.
-    
-    Args:
-        output_dir: The run output directory
-        
-    Returns:
-        Dict with:
-        - 'status': 'completed' | 'error' | 'incomplete' | 'not_found'
-        - 'error_step': step where error occurred (if applicable)
-        - 'last_prompt_step': last step with saved prompt
-    """
+    """Check the status of a run based on its output files."""
     summary_path = os.path.join(output_dir, "run_summary.json")
 
     if not os.path.exists(output_dir):
-        return {"status" : "not_found", "error_step": None, "last_prompt_step" : None}
+        return {"status": "not_found", "error_step": None, "last_prompt_step": None}
 
-    result = {"status" : "incomplete", "error_step" : None, "last_prompt_step" : None}
+    result = {"status": "incomplete", "error_step": None, "last_prompt_step": None}
 
     if os.path.exists(summary_path):
         with open(summary_path, "r") as f:
@@ -489,31 +677,20 @@ def check_run_status(output_dir: str) -> Dict[str, Any]:
         if "error_step" in summary:
             result["status"] = "error"
             result["error_step"] = summary["error_step"]
-            
+
     last_step, _ = find_last_prompt(output_dir)
     result["last_prompt_step"] = last_step
-    
+
     return result
+
 
 def resume_failed_runs(
     futures: Dict[str, Any],
     experiments: List[Dict[str, Any]],
-    runner_pool: Any, 
-    run_name: str
-    ) -> Dict[str, Any]:
-    """Check inactive runs and re-submit failed ones from their error step.
-    
-    Args:
-        futures: Dict of experiment_key -> future from initial submission
-        experiments: List of experiment configurations
-        runner_pool: The AlgorithmRunner pool to submit resumed runs
-        run_name: Name for the run
-        
-    Returns:
-        Dict of experiment_key -> new future for resumed runs
-    """
-    from concurry import wait 
-
+    runner_pool: Any,
+    run_name: str,
+) -> Dict[str, Any]:
+    """Check inactive runs and re-submit failed ones from their error step."""
     resumed_futures = {}
 
     for exp in experiments:
@@ -524,39 +701,40 @@ def resume_failed_runs(
             continue
 
         status = check_run_status(output_dir)
-        
+
         if status["status"] == "error":
             error_step = status["error_step"]
             last_prompt_step, prompt_content = find_last_prompt(output_dir)
-            
-            resume_step = error_step if error_step is not None else (last_prompt_step or 0)
+
+            resume_step = (
+                error_step if error_step is not None else (last_prompt_step or 0)
+            )
 
             print(f"[RESUME] Re-Submitting {exp_key} from step {resume_step}")
 
-            # Re-submit with start_step
             future = runner_pool.run(
                 run_name=run_name,
-                dataset=exp['dataset'],
+                dataset=exp["dataset"],
                 output_dir=output_dir,
-                algo_name=exp['algorithm'],
-                llm=exp['llm'],
-                steps=exp['steps'],
-                api_key=exp['api_key'],
-                batch_size=exp['batch_size'],
-                loss_batch_size=exp['loss_batch_size'],
-                gradient_batch_size=exp['gradient_batch_size'],
-                eval_every=exp['eval_every'],
+                algo_name=exp["algorithm"],
+                llm=exp["llm"],
+                steps=exp["steps"],
+                api_key=exp["api_key"],
+                batch_size=exp["batch_size"],
+                loss_batch_size=exp["loss_batch_size"],
+                gradient_batch_size=exp["gradient_batch_size"],
+                eval_every=exp["eval_every"],
                 verbosity=1,
-                start_step=resume_step,  # Resume from error step
-                resume_prompt=prompt_content,  # Use last saved prompt
+                start_step=resume_step,
+                resume_prompt=prompt_content,
             )
             resumed_futures[exp_key] = future
 
     return resumed_futures
-            
+
 
 class AlgorithmRunner(Worker):
-    """Ray-based worker for running algorithms in parallel.
+    """Worker for running algorithms in parallel.
 
     Each AlgorithmRunner instance creates a shared LimitSet that is used by all
     LLM workers it instantiates, ensuring proper rate limiting across all LLM calls.
@@ -576,8 +754,8 @@ class AlgorithmRunner(Worker):
         run_name: str = "run1",
         llm: str = "llama3.1",
         verbosity: int = 1,
-        start_step: int = 0, ##  Resume from this step
-        resume_prompt: Optional[str] = None, ## Resume from this prompt
+        start_step: int = 0,
+        resume_prompt: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Run algorithm and return results.
@@ -585,27 +763,26 @@ class AlgorithmRunner(Worker):
         Args:
             dataset: Dataset to run on
             algo_name: Algorithm name ("gpo", "opro", "textgrad")
-            api_key: API key for LLM service (required)
-            steps: Number of training steps (required)
-            batch_size: Batch size for training (required)
-            loss_batch_size: Batch size for loss computation (required)
-            gradient_batch_size: Batch size for gradient computation (required)
-            eval_every: Evaluate every N steps (required)
-            run_name: Name for this run (default: "run1")
-            llm: LLM family to use ("llama3.1", "qwen3", "gpt4.1") (default: "llama3.1")
-            verbosity: Logging verbosity (0=silent, 1=default, 2=detailed, 3=debug) (default: 1)
+            api_key: API key for LLM service
+            steps: Number of training steps
+            batch_size: Batch size for training
+            loss_batch_size: Batch size for loss computation
+            gradient_batch_size: Batch size for gradient computation
+            eval_every: Evaluate every N steps
+            run_name: Name for this run
+            llm: LLM family to use
+            verbosity: Logging verbosity (0=silent, 1=default, 2=detailed, 3=debug)
             start_step: Resume from this step
             resume_prompt: Resume from this prompt
         """
         print(
-            f"[AlgorithmRunner] Starting {algo_name} on {dataset.dataset_name} (run: {run_name}, llm: {llm})"
+            f"[AlgorithmRunner] Starting {algo_name} on {dataset.dataset_name} "
+            f"(run: {run_name}, llm: {llm})"
         )
 
         try:
             tasks = dataset.tasks
 
-            # Get configuration
-            # Use task_output_formats from dataset if available, otherwise fall back to DATASET_CONFIGS
             task_output_formats = (
                 dataset.task_output_formats
                 if len(dataset.task_output_formats) > 0
@@ -616,13 +793,12 @@ class AlgorithmRunner(Worker):
                 tasks=tasks,
                 task_output_formats=task_output_formats,
             )
-            task_losses = get_task_losses(dataset_name=dataset.dataset_name, tasks=tasks)
+            task_losses = get_task_losses(
+                dataset_name=dataset.dataset_name, tasks=tasks
+            )
 
-            # Create shared LimitSet for all LLMs in this runner instance
-            # All LLM workers will share these limits for efficient rate limiting
             shared_limits = create_shared_limits()
 
-            # Create LLMs with shared limits
             task_llm = create_task_llm(llm=llm, api_key=api_key, limits=shared_limits)
             optimizer_llm = create_optimizer_llm(
                 llm=llm, api_key=api_key, limits=shared_limits
@@ -632,7 +808,6 @@ class AlgorithmRunner(Worker):
             )
             loss_llm = create_loss_llm(llm=llm, api_key=api_key, limits=shared_limits)
 
-            # Common parameters
             common_params = {
                 "tasks": tasks,
                 "steps": steps,
@@ -644,7 +819,6 @@ class AlgorithmRunner(Worker):
                 "verbosity": verbosity,
             }
 
-            # Create algorithm instance
             if algo_name == "gpo":
                 algo = GPO(
                     task_llm=task_llm,
@@ -675,11 +849,6 @@ class AlgorithmRunner(Worker):
             else:
                 raise ValueError(f"Unknown algorithm: {algo_name}")
 
-            if resume_prompt is not None:
-                pass
-
-
-            # Run training
             results = algo.train(
                 dataset=dataset,
                 initial_prompt=initial_prompt,
@@ -687,11 +856,7 @@ class AlgorithmRunner(Worker):
                 start_step=start_step,
             )
 
-            print(
-                f"[AlgorithmRunner] Completed {algo_name} on {dataset.dataset_name}"
-            )
-            print("#" * 80)
-            print("#" * 80)
+            print(f"[AlgorithmRunner] Completed {algo_name} on {dataset.dataset_name}")
             print("#" * 80)
             return {
                 "status": "success",
@@ -709,10 +874,9 @@ class AlgorithmRunner(Worker):
             }
         except Exception as e:
             print(
-                f"[AlgorithmRunner] Failed {algo_name} on {dataset.dataset_name}:\n{format_exception_msg(e)}"
+                f"[AlgorithmRunner] Failed {algo_name} on {dataset.dataset_name}:\n"
+                f"{format_exception_msg(e)}"
             )
-            print("#" * 80)
-            print("#" * 80)
             print("#" * 80)
             return {
                 "status": "error",

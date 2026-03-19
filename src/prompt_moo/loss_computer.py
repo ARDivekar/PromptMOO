@@ -18,7 +18,8 @@ from .data_structures import (
     Task,
     TextualFeedback,
 )
-from .llm_workers import LLM, BATCH_INVOCATION_TIMEOUT
+from .config import promptmoo_config
+from .llm_utils import apply_prompt_suffix
 
 # Export validator for use when creating LLM pools
 __all__ = [
@@ -59,7 +60,7 @@ class LossComputer(Typed, Registry, ABC):
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
         tasks: List[Task],
-        llm_pool: Optional[LLM],
+        llm_pool: Optional[Any],
         loss_batch_size: int,
         verbosity: int = 1,
         **kwargs: Dict[str, Any],
@@ -158,9 +159,11 @@ class TaskLevelLossComputer(LossComputer):
                 # Call LLM with all prompts in a single batch
                 if len(prompts) > 0:
                     try:
+                        prompts = apply_prompt_suffix(prompts, llm_pool)
+                        cfg = promptmoo_config.defaults
                         responses = llm_pool.call_llm_batch(
                             prompts=prompts, verbosity=verbosity
-                        ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                        ).result(timeout=cfg.batch_invocation_timeout)
 
                         for (pred_batch, _gt_batch), response in zip(
                             task_batches, responses
@@ -170,11 +173,10 @@ class TaskLevelLossComputer(LossComputer):
                                 task_name=task.task_name,
                                 feedback_text=response,
                                 aggregated_from_samples=sample_ids,
-                                feedback_prompt=None,  # Not storing prompt for brevity
+                                feedback_prompt=None,
                             )
                             feedbacks.append(textual)
                     except Exception:
-                        # Skip all textual feedback on error
                         pass
 
             result[task] = feedbacks
@@ -478,9 +480,11 @@ class GPOLossComputer(LossComputer):
                 # Call LLM with all prompts in a single batch
                 if len(prompts) > 0:
                     try:
+                        prompts = apply_prompt_suffix(prompts, llm_pool)
+                        cfg = promptmoo_config.defaults
                         responses = llm_pool.call_llm_batch(
                             prompts=prompts, verbosity=verbosity
-                        ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                        ).result(timeout=cfg.batch_invocation_timeout)
 
                         for (pred_batch, _gt_batch), response in zip(
                             task_batches, responses
@@ -490,11 +494,10 @@ class GPOLossComputer(LossComputer):
                                 task_name=task.task_name,
                                 feedback_text=response,
                                 aggregated_from_samples=sample_ids,
-                                feedback_prompt=None,  # Not storing prompt for brevity
+                                feedback_prompt=None,
                             )
                             feedbacks.append(textual)
                     except Exception:
-                        # Skip all textual feedback on error
                         pass
 
             result[task] = feedbacks
@@ -580,9 +583,11 @@ class TextGradLossComputer(LossComputer):
             feedbacks: List[Union[NumericFeedback, TextualFeedback]] = []
             if len(prompts) > 0:
                 try:
+                    prompts = apply_prompt_suffix(prompts, llm_pool)
+                    cfg = promptmoo_config.defaults
                     responses = llm_pool.call_llm_batch(
                         prompts=prompts, verbosity=verbosity
-                    ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                    ).result(timeout=cfg.batch_invocation_timeout)
 
                     for (pred_batch, _gt_batch), response in zip(
                         task_batches, responses
@@ -592,11 +597,10 @@ class TextGradLossComputer(LossComputer):
                             task_name=task.task_name,
                             feedback_text=response,
                             aggregated_from_samples=sample_ids,
-                            feedback_prompt=None,  # Not storing prompt for brevity
+                            feedback_prompt=None,
                         )
                         feedbacks.append(textual)
                 except Exception:
-                    # Skip all textual feedback on error
                     pass
 
             result[task] = feedbacks

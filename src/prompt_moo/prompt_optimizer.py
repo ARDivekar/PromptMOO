@@ -5,7 +5,6 @@ This is Step 4 of the optimization pipeline.
 """
 
 import json
-import time
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Dict, List, Optional
 
@@ -14,7 +13,8 @@ from morphic import Registry, Typed
 from morphic.typed import format_exception_msg
 
 from .data_structures import Batch, OptimizerResult, Task, TextGradient
-from .llm_workers import LLM, BATCH_INVOCATION_TIMEOUT
+from .config import promptmoo_config
+from .llm_utils import apply_prompt_suffix
 from .prompt_template_utils import PromptTemplate
 from .prompt_trajectory import PromptTrajectory
 
@@ -116,7 +116,7 @@ class PromptOptimizer(Typed, Registry, ABC):
         gradients: Dict[Task, List[TextGradient]],
         current_prompt: PromptTemplate,
         tasks: List[Task],
-        llm_pool: LLM,
+        llm_pool: Any,
         verbosity: int = 1,
         **kwargs: Dict[str, Any],
     ) -> OptimizerResult:
@@ -147,40 +147,26 @@ class PromptOptimizer(Typed, Registry, ABC):
             **kwargs,
         )
 
-        # Call optimizer LLM
+        # Call optimizer LLM with validator for parsing
+        def _optimizer_validator(response_text: str) -> Dict[str, str]:
+            return self.parse_meta_prompt_response(
+                response=response_text, tasks=tasks, **kwargs
+            )
+
+        cfg = promptmoo_config.defaults
+        prompts_to_send = apply_prompt_suffix([meta_prompt], llm_pool)
         responses = llm_pool.call_llm_batch(
-            prompts=[meta_prompt], verbosity=verbosity
-        ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+            prompts=prompts_to_send,
+            verbosity=verbosity,
+            validator=_optimizer_validator,
+        ).result(timeout=cfg.batch_invocation_timeout)
         if len(responses) == 0:
             raise ValueError(f"{self.__class__.__name__}: No responses from LLM")
-        response = responses[0]
-
-        # Parse response into new instructions with retry logic
-        max_retries = 5
-        last_exception = None
-        new_instructions = None
-
-        for attempt in range(max_retries):
-            try:
-                new_instructions = self.parse_meta_prompt_response(
-                    response=response, tasks=tasks, **kwargs
-                )
-                break  # Success, exit retry loop
-            except Exception as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    time.sleep(0.01)  # Wait before retrying
-
-        # If all retries failed, raise the last exception
-        if new_instructions is None:
-            raise ValueError(
-                f"{self.__class__.__name__}: Failed to parse response after {max_retries} attempts. "
-                f"Last error: {last_exception}"
-            )
+        new_instructions = responses[0]
 
         if len(new_instructions) == 0:
             raise ValueError(
-                f"{self.__class__.__name__}: Failed to parse any instructions from response: {response}"
+                f"{self.__class__.__name__}: Parsed instructions dict is empty"
             )
 
         # Update tasks with new instructions
@@ -193,7 +179,7 @@ class PromptOptimizer(Typed, Registry, ABC):
                     task_instruction=new_instructions.get(
                         task.task_name, task.task_instruction
                     ),
-                    gt_col=task.gt_col,  # Preserve ground truth column mapping
+                    gt_col=task.gt_col,
                 )
             )
 
@@ -205,11 +191,10 @@ class PromptOptimizer(Typed, Registry, ABC):
             tasks=updated_tasks,
         )
 
-        # Return result with LLM interaction details for observability
         return OptimizerResult(
             new_prompt=new_prompt,
             meta_prompt=meta_prompt,
-            raw_response=response,
+            raw_response=str(new_instructions),
         )
 
 
@@ -360,7 +345,8 @@ class OPROOptimizer(PromptOptimizer):
 
         task_names: List[str] = [t.task_name for t in tasks]
 
-        meta_prompt = f"""Generate improved instructions in JSON format, based on the previous performances:
+        meta_prompt = f"""
+Generate improved instructions in JSON format, based on the previous performances:
 
 {top_k_str}
 

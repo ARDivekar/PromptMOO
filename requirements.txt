@@ -1,4 +1,4 @@
-concurry[all]==0.*
+concurry[all]>=0.13.0
 datasets==4.0.0
 dotenv
 litellm==1.*
@@ -11,6 +11,7 @@ pydantic==2.12.3
 pytest==8.4.2
 pytest-timeout
 scikit-learn==1.7.0
+slowburn[all]>=0.5.3
 fastparquet
 hvplot
 bokeh

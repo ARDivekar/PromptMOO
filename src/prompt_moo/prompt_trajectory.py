@@ -20,10 +20,10 @@ class TrajectoryElement(Typed):
     - Loss function metadata
     """
 
-    loss_fns: Dict[str, Any]                    # Map of task_name -> loss function config
-    scores: Dict[str, Dict[str, float]]         # Map of task_name -> {metric: score}
-    grads: Dict[str, str]                       # Map of task_name -> gradient text
-    instructions: Union[str, Dict[str, str]]    # Prompt instructions
+    loss_fns: Dict[str, Any]  # Map of task_name -> loss function config
+    scores: Dict[str, Dict[str, float]]  # Map of task_name -> {metric: score}
+    grads: Dict[str, str]  # Map of task_name -> gradient text
+    instructions: Union[str, Dict[str, str]]  # Prompt instructions
 
     def ranking_metric(self) -> float:
         """Compute the combined ranking metric across all tasks.
@@ -119,30 +119,44 @@ class PromptTrajectory(Typed):
         """
         return "\n".join([str(e) for e in self.get_topk()])
 
+
 class OPROTrajectoryElement(TrajectoryElement):
-    '''OPRO-specific trajectory element - uses score as the only gradient signal.'''
+    """OPRO-specific trajectory element - uses score as the only gradient signal."""
 
     def __str__(self) -> str:
         ## Only show scores and instructions
         lines = []
-        lines.append("Instructions: " + (self.instructions if
-            isinstance(self.instructions, str) else json.dumps(self.instructions)))
+        lines.append(
+            "Instructions: "
+            + (
+                self.instructions
+                if isinstance(self.instructions, str)
+                else json.dumps(self.instructions)
+            )
+        )
         lines.append("Scores:")
         for task_name, task_scores in self.scores.items():
             for metric_name, value in task_scores.items():
                 lines.append(f"  {task_name} ({metric_name}): {value:.4f}")
         return "\n".join(lines)
 
+
 class GPOTrajectoryElement(TrajectoryElement):
     """GPO-specific trajectory element - includes textual and numerical gradients."""
 
     text_grads: List[str] = []
-    numerical_grads: Optional[str] = None 
+    numerical_grads: Optional[str] = None
 
     def __str__(self) -> str:
         lines = []
-        lines.append("Instructions: " + (self.instructions if isinstance(self.instructions, str) 
-                     else json.dumps(self.instructions)))
+        lines.append(
+            "Instructions: "
+            + (
+                self.instructions
+                if isinstance(self.instructions, str)
+                else json.dumps(self.instructions)
+            )
+        )
         lines.append("Scores:")
         for task_name, task_scores in self.scores.items():
             for metric, value in task_scores.items():

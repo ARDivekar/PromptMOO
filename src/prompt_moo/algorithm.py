@@ -29,8 +29,14 @@ from .loss_computer import LossComputer
 from .observability import ObservabilityManager
 from .prompt_optimizer import PromptOptimizer
 from .prompt_template_utils import PromptTemplate
-from .prompt_trajectory import PromptTrajectory, TrajectoryElement, OPROTrajectoryElement, GPOTrajectoryElement
+from .prompt_trajectory import (
+    PromptTrajectory,
+    TrajectoryElement,
+    OPROTrajectoryElement,
+    GPOTrajectoryElement,
+)
 from .task_predictor import TaskPredictor
+from .config import promptmoo_config
 
 
 class PromptAlgorithm(Typed, Registry, ABC):
@@ -67,7 +73,7 @@ class PromptAlgorithm(Typed, Registry, ABC):
     verbosity: int = (
         1  # 0=silent, 1=default (progress bar), 2=detailed, 3=debug (with LLM I/O)
     )
-    substep_delay: float = 1.5  # Delay in seconds between substeps (for rate limiting)
+    substep_delay: Optional[float] = None
 
     # Tasks
     tasks: List[Task]
@@ -77,7 +83,7 @@ class PromptAlgorithm(Typed, Registry, ABC):
         dataset: Dataset,
         initial_prompt: PromptTemplate,
         output_dir: Optional[str] = None,
-        start_step: int = 0 ## Resume from this step
+        start_step: int = 0,  ## Resume from this step
     ) -> Dict[str, Any]:
         """Main training loop.
 
@@ -92,6 +98,11 @@ class PromptAlgorithm(Typed, Registry, ABC):
         """
         # Setup observability
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Resolve substep_delay from config if not explicitly set
+        _substep_delay = self.substep_delay
+        if _substep_delay is None:
+            _substep_delay = promptmoo_config.defaults.substep_delay
         if output_dir is None:
             output_dir = (
                 f"outputs/{self.class_name}_{dataset.dataset_name}_{self.name}_{run_id}"
@@ -113,7 +124,7 @@ class PromptAlgorithm(Typed, Registry, ABC):
             "eval_every": self.eval_every,
             "tasks": [t.model_dump() for t in self.tasks],
             "initial_prompt": initial_prompt.to_str(),
-            "start_step" : start_step
+            "start_step": start_step,
         }
         observer = ObservabilityManager(output_dir)
         observer.log_config(run_config)
@@ -130,9 +141,12 @@ class PromptAlgorithm(Typed, Registry, ABC):
         # Control progress bar based on verbosity
         disable_progress_bar = self.verbosity == 0
         current_step = start_step
-        try: 
+        try:
             for step in ProgressBar(
-                list(range(start_step, self.steps)), desc="Training", disable=disable_progress_bar
+                list(range(start_step, self.steps)),
+                desc="Algorithm Progress",
+                disable=disable_progress_bar,
+                style="notebook",
             ):
                 current_step = step
                 if self.verbosity >= 2:
@@ -166,8 +180,8 @@ class PromptAlgorithm(Typed, Registry, ABC):
                 observer.log_algorithm_context(algorithm_context)
 
                 # Delay between substeps for rate limiting
-                if self.substep_delay > 0:
-                    time.sleep(self.substep_delay)
+                if _substep_delay > 0:
+                    time.sleep(_substep_delay)
 
                 # Step 2: Compute losses/feedback
                 if self.verbosity >= 2:
@@ -186,8 +200,8 @@ class PromptAlgorithm(Typed, Registry, ABC):
                     print(f"  Computed feedbacks for {len(feedbacks)} tasks")
 
                 # Delay between substeps for rate limiting
-                if self.substep_delay > 0:
-                    time.sleep(self.substep_delay)
+                if _substep_delay > 0:
+                    time.sleep(_substep_delay)
 
                 # Step 3: Compute gradients
                 if self.verbosity >= 2:
@@ -206,8 +220,8 @@ class PromptAlgorithm(Typed, Registry, ABC):
                     print(f"  Computed gradients for {len(gradients)} tasks")
 
                 # Delay between substeps for rate limiting
-                if self.substep_delay > 0:
-                    time.sleep(self.substep_delay)
+                if _substep_delay > 0:
+                    time.sleep(_substep_delay)
 
                 # Step 4: Optimize prompt
                 if self.verbosity >= 2:
@@ -263,18 +277,13 @@ class PromptAlgorithm(Typed, Registry, ABC):
             observer.finalize()
             if self.verbosity >= 1:
                 print(f"\nTraining complete! Results saved to: {output_dir}")
-            run_logs_path = os.path.join(output_dir, "run_logs.parquet")
             try:
-                run_logs = pd.read_parquet(run_logs_path, engine="pyarrow")
+                run_logs = ObservabilityManager.read_run_logs(output_dir)
             except Exception as e:
                 raise IOError(
-                    f"Failed to read run logs parquet at {run_logs_path!r}:\n"
+                    f"Failed to read run logs from {output_dir!r}:\n"
                     f"{format_exception_msg(e)}"
                 ) from e
-            # run_logs.to_parquet(
-            #     os.path.join(output_dir, "run_logs.parquet"), engine="fastparquet"
-            # )
-
             return {
                 "run_id": run_id,
                 "run_config": run_config,
@@ -489,7 +498,7 @@ class OPRO(PromptAlgorithm):
                         score_counts[task.task_name][metric] = 0
                     scores[task.task_name][metric] += fb.value
                     score_counts[task.task_name][metric] += 1
-        
+
         # Compute averages
         for task_name in scores:
             for metric in scores[task_name]:
@@ -502,7 +511,9 @@ class OPRO(PromptAlgorithm):
         # for task, grad_list in gradients.items():
         #     grads[task.task_name] = " ".join(g.gradient_text for g in grad_list)
         for task_name, task_scores in scores.items():
-            metric_strs = [f"{metric}: {value:.4f}" for metric, value in task_scores.items()]
+            metric_strs = [
+                f"{metric}: {value:.4f}" for metric, value in task_scores.items()
+            ]
             grads[task_name] = ", ".join(metric_strs)
 
         # Extract instructions
@@ -526,12 +537,16 @@ class OPRO(PromptAlgorithm):
             loss_fns=loss_fns, scores=scores, grads=grads, instructions=instructions
         )
         self.trajectory.push(element)
-        
+
         # Debug output when verbosity >= 2
         if self.verbosity >= 2:
             top_k_str = self.trajectory.get_top_k_str()
-            print(f"\\n[OPRO Debug] Trajectory top-k string length: {len(top_k_str)} chars")
-            print(f"[OPRO Debug] Trajectory element count: {len(self.trajectory)}/{self.k}")
+            print(
+                f"\\n[OPRO Debug] Trajectory top-k string length: {len(top_k_str)} chars"
+            )
+            print(
+                f"[OPRO Debug] Trajectory element count: {len(self.trajectory)}/{self.k}"
+            )
             print(f"[OPRO Debug] Top-k string preview:")
             print(top_k_str)
             # print(f"[OPRO Debug] Top-k string preview (last 500 chars):")
@@ -648,7 +663,7 @@ class GPO(PromptAlgorithm):
                         score_counts[task.task_name][metric] = 0
                     scores[task.task_name][metric] += fb.value
                     score_counts[task.task_name][metric] += 1
-        
+
         # Compute averages
         for task_name in scores:
             for metric in scores[task_name]:
@@ -666,10 +681,12 @@ class GPO(PromptAlgorithm):
         for task, grad_list in gradients.items():
             # Each grad in grad_list is a Textual gradient from LLM
             textual_grads = [g.gradient_text for g in grad_list]
-            
+
             # Add numerical summary ass the last element
             task_scores = scores.get(task.task_name, {})
-            numerical_summary = ", ".join(f"{metric}: {score:.4f}" for metric, score in task_scores.items())
+            numerical_summary = ", ".join(
+                f"{metric}: {score:.4f}" for metric, score in task_scores.items()
+            )
 
             # Combine textual gradients and numerical summary
             all_grads = textual_grads + [f"[Score] {numerical_summary}"]
@@ -698,19 +715,29 @@ class GPO(PromptAlgorithm):
         for task, grad_list in gradients.items():
             text_grads_list.extend([g.gradient_text for g in grad_list])
             task_scores = scores.get(task.task_name, {})
-            numerical_summary = ", ".join(f"{m}: {v:.4f}" for m, v in task_scores.items())
-        
+            numerical_summary = ", ".join(
+                f"{m}: {v:.4f}" for m, v in task_scores.items()
+            )
+
         element = GPOTrajectoryElement(
-            loss_fns=loss_fns, scores=scores, grads=grads, instructions=instructions,
-            text_grads=text_grads_list, numerical_grads=numerical_summary
+            loss_fns=loss_fns,
+            scores=scores,
+            grads=grads,
+            instructions=instructions,
+            text_grads=text_grads_list,
+            numerical_grads=numerical_summary,
         )
         self.trajectory.push(element)
-        
+
         # Debug output when verbosity >= 2
         if self.verbosity >= 2:
             top_k_str = self.trajectory.get_top_k_str()
-            print(f"\\n[GPO Debug] Trajectory top-k string length: {len(top_k_str)} chars")
-            print(f"[GPO Debug] Trajectory element count: {len(self.trajectory)}/{self.k}")
+            print(
+                f"\\n[GPO Debug] Trajectory top-k string length: {len(top_k_str)} chars"
+            )
+            print(
+                f"[GPO Debug] Trajectory element count: {len(self.trajectory)}/{self.k}"
+            )
             print(f"[GPO Debug] Top-k string preview (first 500 chars):")
             print(top_k_str[:500])
             print(f"[GPO Debug] Top-k string preview (last 500 chars):")

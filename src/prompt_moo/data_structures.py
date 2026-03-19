@@ -185,9 +185,11 @@ class OptimizerResult(Typed):
     meta_prompt: str
     raw_response: str
 
+
 # ---------------------------------------------------------------------------
 # Typed metric output classes
 # ---------------------------------------------------------------------------
+
 
 class StepMetricResult(Typed):
     """Metric values for every task at a single evaluation step.
@@ -238,6 +240,7 @@ class ExptMetricReport(Typed):
     metric_name: str
     algo_reports: Dict[str, AlgoMetricSeries]
 
+
 class TaskMetricResult(Typed):
     """
     Metrics computed for a single task at a single step.
@@ -249,6 +252,7 @@ class TaskMetricResult(Typed):
     precision: Optional[float]
     recall: Optional[float]
 
+
 class StepMultiMetricResult(Typed):
     """
     All task metrics for a single step.
@@ -258,4 +262,6 @@ class StepMultiMetricResult(Typed):
     algo_name: str
     step: int
     split: str
-    task_metrics: List[Any] # TaskMetricResult - using Any to avoid circular import issues
+    task_metrics: List[
+        Any
+    ]  # TaskMetricResult - using Any to avoid circular import issues

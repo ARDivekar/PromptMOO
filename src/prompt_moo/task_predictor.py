@@ -11,9 +11,10 @@ from typing import Any, List
 from morphic import Registry, Typed
 from morphic.typed import format_exception_msg
 
+from .config import promptmoo_config
 from .data_structures import Batch, PredictionResult
+from .llm_utils import apply_prompt_suffix
 from .prompt_template_utils import PromptTemplate
-from .llm_workers import BATCH_INVOCATION_TIMEOUT
 
 # Export validator for use when creating LLM pools
 __all__ = ["TaskPredictor", "StandardTaskPredictor", "validate_task_response"]
@@ -31,6 +32,17 @@ def parse_task_response(response: str, **context) -> dict:
     Raises:
         ValueError: If no valid JSON found or parsing fails
     """
+    if response is None:
+        raise ValueError("Response from LLM was None.")
+
+    if isinstance(response, Exception):
+        raise ValueError(
+            f"LLM call resulted in an exception: {format_exception_msg(response)}"
+        )
+
+    if not isinstance(response, str):
+        response = str(response)
+
     # Extract JSON block from response
     response = response.strip().replace("{{", "{").replace("}}", "}")
     start = response.find("{")
@@ -67,6 +79,9 @@ def validate_task_response(result: str, **context) -> bool:
     Returns:
         True if response contains valid JSON, False otherwise
     """
+    if result is None or not isinstance(result, str):
+        return False
+
     try:
         start = result.find("{")
         end = result.rfind("}") + 1
@@ -146,13 +161,12 @@ class StandardTaskPredictor(TaskPredictor):
                 prompt += f"{col}: {val}\n"
             prompts.append(prompt)
 
-        # Parallel LLM calls
+        prompts = apply_prompt_suffix(prompts, llm_pool)
+        cfg = promptmoo_config.defaults
         responses = llm_pool.call_llm_batch(
-            prompts=prompts, 
+            prompts=prompts,
             verbosity=verbosity,
-        ).result(
-            timeout=BATCH_INVOCATION_TIMEOUT
-        )
+        ).result(timeout=cfg.batch_invocation_timeout)
 
         # Parse responses into PredictionResult
         results = []

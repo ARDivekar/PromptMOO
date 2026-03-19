@@ -7,9 +7,9 @@ This is Step 3 of the optimization pipeline.
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
-from concurry import BaseFuture
 from morphic import Registry, Typed
 
+from .config import promptmoo_config
 from .data_structures import (
     CombinedFeedback,
     NumericFeedback,
@@ -17,7 +17,7 @@ from .data_structures import (
     TextGradient,
     TextualFeedback,
 )
-from .llm_workers import LLM, BATCH_INVOCATION_TIMEOUT
+from .llm_utils import apply_prompt_suffix
 from .prompt_template_utils import PromptTemplate
 
 # Export validator for use when creating LLM pools
@@ -59,7 +59,7 @@ class GradientComputer(Typed, Registry, ABC):
         feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
         prompt_template: PromptTemplate,
         tasks: List[Task],
-        llm_pool: Optional[LLM],
+        llm_pool: Optional[Any],
         gradient_batch_size: int,
         verbosity: int = 1,
         **kwargs: Dict,
@@ -162,9 +162,10 @@ class StandardGradientComputer(GradientComputer):
             gradients = []
             if len(prompts) > 0:
                 try:
+                    prompts = apply_prompt_suffix(prompts, llm_pool)
                     responses = llm_pool.call_llm_batch(
                         prompts=prompts, verbosity=verbosity
-                    ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                    ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
 
                     for fb_batch, response in zip(feedback_batches, responses):
                         # Create TextGradient
@@ -345,9 +346,10 @@ class GPOGradientComputer(GradientComputer):
             gradients = []
             if len(prompts) > 0:
                 try:
+                    prompts = apply_prompt_suffix(prompts, llm_pool)
                     responses = llm_pool.call_llm_batch(
                         prompts=prompts, verbosity=verbosity
-                    ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                    ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
 
                     for fb_batch, response in zip(feedback_batches, responses):
                         # Aggregate feedback IDs from all combined feedbacks
@@ -563,9 +565,10 @@ class TextGradGradientComputer(GradientComputer):
             gradients = []
             if len(prompts) > 0:
                 try:
+                    prompts = apply_prompt_suffix(prompts, llm_pool)
                     responses = llm_pool.call_llm_batch(
                         prompts=prompts, verbosity=verbosity
-                    ).result(timeout=BATCH_INVOCATION_TIMEOUT)
+                    ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
 
                     for fb_batch, response in zip(feedback_batches, responses):
                         # Aggregate feedback IDs

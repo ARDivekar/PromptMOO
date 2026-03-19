@@ -46,12 +46,10 @@ class Dataset(Typed, Registry, ABC):
             df = pd.read_parquet(path, engine="pyarrow")
         except Exception as e:
             raise IOError(
-                f"Failed to read train parquet at {path!r}:\n"
-                f"{format_exception_msg(e)}"
+                f"Failed to read train parquet at {path!r}:\n{format_exception_msg(e)}"
             ) from e
         return (
-            df
-            .sample(frac=1, random_state=self.seed)
+            df.sample(frac=1, random_state=self.seed)
             .reset_index(drop=True)
             .head(self.train_size)
         )
@@ -62,12 +60,10 @@ class Dataset(Typed, Registry, ABC):
             df = pd.read_parquet(path, engine="pyarrow")
         except Exception as e:
             raise IOError(
-                f"Failed to read test parquet at {path!r}:\n"
-                f"{format_exception_msg(e)}"
+                f"Failed to read test parquet at {path!r}:\n{format_exception_msg(e)}"
             ) from e
         return (
-            df
-            .sample(frac=1, random_state=self.seed)
+            df.sample(frac=1, random_state=self.seed)
             .reset_index(drop=True)
             .head(self.test_size)
         )

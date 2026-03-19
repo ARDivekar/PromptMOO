@@ -1,13 +1,14 @@
-import os 
-import pandas as pd 
+import os
+import pandas as pd
 import numpy as np
 
 import hvplot.pandas  # required for hvplot
 import holoviews as hv
+
 hv.extension("bokeh")
 
-from typing import Dict, List, Optional, Tuple, ClassVar 
-from morphic import Typed, Registry 
+from typing import Dict, List, Optional, Tuple, ClassVar
+from morphic import Typed, Registry
 from morphic.typed import format_exception_msg
 
 from .data_structures import TaskMetricResult, StepMultiMetricResult
@@ -20,21 +21,27 @@ class Analysis(Typed, Registry):
 
 ####################### METRIC SUBCLASS #######################
 
+
 class Metric(Analysis):
     """
     Base metric class.
     """
-    name: str 
+
+    name: str
+
     def compute(self, y_true, y_pred) -> float:
         raise NotImplementedError
+
 
 class Accuracy(Metric):
     """
     Accuracy metric.
     """
+
     name: str = "accuracy"
+
     def compute(self, y_true, y_pred) -> float:
-        y_true =  np.array(y_true)
+        y_true = np.array(y_true)
         y_pred = np.array(y_pred)
 
         if len(y_true) != len(y_pred):
@@ -44,6 +51,7 @@ class Accuracy(Metric):
             return 0.0
 
         return float((y_true == y_pred).mean())
+
 
 class Precision(Metric):
     name: str = "precision"
@@ -71,6 +79,7 @@ class Precision(Metric):
 
         return float(np.mean(precisions))
 
+
 class Recall(Metric):
     name: str = "recall"
 
@@ -97,12 +106,12 @@ class Recall(Metric):
 
         return float(np.mean(recalls))
 
+
 class F1(Metric):
     name: str = "f1"
     average: str = "macro"
 
     def compute(self, y_true, y_pred) -> float:
-
         y_true = np.array(y_true)
         y_pred = np.array(y_pred)
 
@@ -133,7 +142,9 @@ class F1(Metric):
 
         return float(np.mean(f1_scores))
 
+
 ###################### VISUALIZATION SUBCLASS ##############################
+
 
 class Visualizer(Analysis):
     _allow_subclass_override: ClassVar[bool] = True
@@ -156,7 +167,6 @@ class LinePlot(Visualizer):
     title: Optional[str] = None
 
     def render(self):
-
         if self.df.empty:
             raise ValueError("Provided DataFrame is empty")
 
@@ -167,11 +177,7 @@ class LinePlot(Visualizer):
         tasks = self.df["task_name"].unique()
 
         for task in tasks:
-
-            task_df = (
-                self.df[self.df["task_name"] == task]
-                .sort_values("step")
-            )
+            task_df = self.df[self.df["task_name"] == task].sort_values("step")
 
             color = None
             if self.metric_colors:
@@ -207,6 +213,138 @@ class LinePlot(Visualizer):
             ylim=(0, 1),
             legend_position="right",
         )
+
+
+class HeatmapPlot(Visualizer):
+    """
+    Confusion-matrix heatmap for evaluation steps.
+
+    Behavior:
+    - Detects which tasks actually exist in the parquet file
+    - Warns if dataset_config tasks are missing
+    - Plots only tasks present in the run
+    """
+
+    run_ctx: SingleRunContext
+    annot: bool = True
+    cmap: str = "Blues"
+    title: Optional[str] = None
+    width: int = 400
+    height: int = 400
+    verbose: bool = False
+
+    def render(self, step: int):
+        parquet_path = os.path.join(self.run_ctx.run_dir, f"eval_step_{step}.parquet")
+
+        if not os.path.exists(parquet_path):
+            raise FileNotFoundError(f"Evaluation file not found: {parquet_path}")
+
+        try:
+            eval_df = pd.read_parquet(parquet_path, engine="pyarrow")
+        except Exception as e:
+            raise IOError(f"Failed to read parquet: {format_exception_msg(e)}")
+
+        dataset_tasks = tuple(self.run_ctx.dataset_config["task_output_formats"].keys())
+
+        present_tasks = []
+
+        # --------------------------------------------------
+        # Detect which tasks are actually present
+        # --------------------------------------------------
+        for task in dataset_tasks:
+            gt_col = f"gt_{task}"
+            pred_col = f"pred_{task}"
+
+            if gt_col in eval_df.columns and pred_col in eval_df.columns:
+                present_tasks.append(task)
+            else:
+                if self.verbose:
+                    print(
+                        f"[WARNING] - Task {task} is not present | "
+                        f"present cols: {list(eval_df.columns)}"
+                    )
+                else:
+                    print(f"[WARNING] - Task {task} is not present")
+
+        if len(present_tasks) == 0:
+            raise ValueError("No valid task columns found in parquet")
+
+        plots = []
+
+        ## Build heatmap for each present task
+        for task in present_tasks:
+            gt_col = f"gt_{task}"
+            pred_col = f"pred_{task}"
+
+            y_true = eval_df[gt_col].dropna()
+            y_pred = eval_df[pred_col].dropna()
+
+            common_idx = y_true.index.intersection(y_pred.index)
+
+            y_true = y_true.loc[common_idx]
+            y_pred = y_pred.loc[common_idx]
+
+            labels = sorted(set(y_true.unique()) | set(y_pred.unique()), key=str)
+
+            cm = pd.crosstab(
+                y_true,
+                y_pred,
+                rownames=["Actual"],
+                colnames=["Predicted"],
+                dropna=False,
+            )
+
+            cm = cm.reindex(index=labels, columns=labels, fill_value=0)
+
+            records = [
+                (str(pred), str(act), int(cm.loc[act, pred]))
+                for act in labels
+                for pred in labels
+            ]
+
+            heatmap = hv.HeatMap(
+                records,
+                kdims=["Predicted", "Actual"],
+                vdims=["Count"],
+            ).opts(
+                cmap=self.cmap,
+                width=self.width,
+                height=self.height,
+                title=task.capitalize(),
+                colorbar=True,
+                xrotation=45,
+                tools=["hover"],
+            )
+
+            plot = heatmap
+
+            if self.annot:
+                labels_overlay = hv.Labels(
+                    [(p, a, str(c)) for p, a, c in records],
+                    kdims=["Predicted", "Actual"],
+                    vdims=["Count"],
+                ).opts(
+                    text_font_size="10pt",
+                    text_color="black",
+                )
+
+                plot = heatmap * labels_overlay
+
+            plots.append(plot)
+
+        ## Layout logic
+        if len(plots) == 1:
+            return plots[0].opts(title=self.title or f"Confusion Matrix — Step {step}")
+
+        layout = plots[0]
+
+        for p in plots[1:]:
+            layout = layout + p
+
+        return layout.opts(title=self.title or f"Confusion Matrix — Step {step}").cols(
+            len(plots)
+        )
+
 
 class ExptEvaluator(Typed, Registry):
     _allow_subclass_override: ClassVar[bool] = True
@@ -310,9 +448,7 @@ class ExptEvaluator(Typed, Registry):
 
         for fname in os.listdir(base_dir):
             if fname.startswith("eval_step_") and fname.endswith(".parquet"):
-                step_num = int(
-                    fname.replace("eval_step_", "").replace(".parquet", "")
-                )
+                step_num = int(fname.replace("eval_step_", "").replace(".parquet", ""))
                 step_files.append((step_num, fname))
 
         step_files.sort()
@@ -347,16 +483,18 @@ class ExptEvaluator(Typed, Registry):
                 rows.append(row)
 
         return pd.DataFrame(rows)
+
+
 if __name__ == "__main__":
     mega_dir_path = "./outputs/All_Together_B48_L3_G4/"
     dirs: List[str] = ["2", "3", "4", "5_5", "6"]
     dataset_config = {
         "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
         "task_output_formats": {
-            "fluency": "An integer between 1 to 5",                         # "1|2|3|4|5",
-            "coherence": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "relevance": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "consistency": "An integer between 1 to 5",                     # "1|2|3|4|5",
+            "fluency": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "coherence": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "relevance": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "consistency": "An integer between 1 to 5",  # "1|2|3|4|5",
         },
         "task_losses": {
             "fluency": "accuracy",
@@ -375,7 +513,7 @@ if __name__ == "__main__":
 
         print(ctx.keys())
 
-        plot_dir : str = dir_path + "/plots"
+        plot_dir: str = dir_path + "/plots"
         os.makedirs(plot_dir, exist_ok=True)
 
         for ctx_key, ctx_val in ctx.items():
@@ -388,21 +526,35 @@ if __name__ == "__main__":
                 k=5,
             )
 
-            print(results.head())
-            print('\n' * 5)
+            # Create subplots for each metric
+            plots = []
 
-            # plot = LinePlot.of(
-            #     df=results,
-            #     metric="accuracy",
-            #     metric_colors={
-            #         "fluency": "#2ca02c",
-            #         "coherence": "#1f77b4",
-            #         "relevance": "#9467bd",
-            #         "consistency": "#ff7f0e",
-            #     },
-            #     title=f"{ctx_key.split('_')[0]} - SummEval"
-            # )
+            for metric_name in ["accuracy", "f1", "precision", "recall"]:
+                single_plot = LinePlot.of(
+                    df=results,
+                    metric=metric_name,
+                    metric_colors={
+                        "fluency": "#2ca02c",
+                        "coherence": "#1f77b4",
+                        "relevance": "#9467bd",
+                        "consistency": "#ff7f0e",
+                    },
+                    title=f"{ctx_key.split('_')[0]} - {metric_name.capitalize()}",
+                )
 
-            # ## Saving a jpg file
-            # hv.save(plot.render(), f"{plot_dir}/plot_{ctx_key}_accuracy.html")
-            # print(f"Saved plot to {plot_dir}/plot_{ctx_key}_accuracy.html")
+                plots.append(single_plot.render())
+
+            # Combine into a vertical layout
+            combined_plot = plots[0]
+            for p in plots[1:]:
+                combined_plot = combined_plot + p  # '+' creates subplots (Layout)
+
+            # Arrange as 2 columns (optional)
+            combined_plot = combined_plot.cols(2)
+
+            # Save combined subplot
+            hv.save(combined_plot, f"{plot_dir}/plot_{ctx_key}_all_metrics.html")
+
+            print(
+                f"Saved combined subplot to {plot_dir}/plot_{ctx_key}_all_metrics.html"
+            )

@@ -2,11 +2,11 @@
 PromptMOO: Multi-Objective Prompt Optimization Framework
 
 This package provides a modular framework for optimizing prompts across multiple objectives
-using algorithms like OPRO with textual gradients.
+using algorithms like OPRO, GPO, and TextGrad.
 
 Key Components:
-- algorithm: Core optimization algorithms (OPRO)
-- llm_workers: Concurry-based LLM worker pools with rate limiting
+- algorithm: Core optimization algorithms (OPRO, GPO, TextGrad)
+- config: Centralized configuration system (promptmoo_config)
 - data_structures: Immutable data classes (Task, Batch, PredictionResult, etc.)
 - task_predictor: Generate predictions using task LLM
 - loss_computer: Compute numeric and textual feedback
@@ -17,6 +17,9 @@ Key Components:
 
 # Core algorithm classes
 from .algorithm import GPO, OPRO, PromptAlgorithm, TextGrad
+
+# Configuration
+from .config import PromptMOOConfig, PromptMOODefaults, promptmoo_config, temp_config
 
 # Data structures
 from .data_structures import (
@@ -32,9 +35,6 @@ from .data_structures import (
     ExptMetricReport,
     StepMetricResult,
 )
-
-# LLM infrastructure
-from .llm_workers import LLM
 
 # Pipeline components
 from .task_predictor import StandardTaskPredictor, TaskPredictor
@@ -72,6 +72,11 @@ __all__ = [
     "OPRO",
     "GPO",
     "TextGrad",
+    # Configuration
+    "promptmoo_config",
+    "temp_config",
+    "PromptMOOConfig",
+    "PromptMOODefaults",
     # Data structures
     "Task",
     "DatasetSample",
@@ -81,8 +86,6 @@ __all__ = [
     "TextualFeedback",
     "CombinedFeedback",
     "TextGradient",
-    # LLM infrastructure
-    "LLM",
     # Pipeline components
     "TaskPredictor",
     "StandardTaskPredictor",

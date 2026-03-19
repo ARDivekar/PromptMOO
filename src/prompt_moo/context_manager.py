@@ -1,10 +1,12 @@
 import os, re, json, hashlib
 from typing import Dict, List, Optional, Union, Any, ClassVar
-from pydantic import BaseModel, Field, conint 
+from pydantic import BaseModel, Field, conint
 from morphic import Typed, Registry
+
 # from morphic.string import hash as hash_str
-from .data_structures import Task 
+from .data_structures import Task
 from .data_input import Dataset
+
 
 class SingleRunContext(Typed, Registry):
     """
@@ -13,31 +15,27 @@ class SingleRunContext(Typed, Registry):
 
     _allow_subclass_override: ClassVar[bool] = True
 
-    algo_name: str 
+    algo_name: str
     run_id: Optional[str]
-    unique_id: str 
+    unique_id: str
 
-    run_dir: str 
+    run_dir: str
 
     dataset_config: Dict[str, Any]
 
-    prompts_dir: str 
-    logs_path: str 
-    summary_path: str 
+    prompts_dir: str
+    logs_path: str
+    summary_path: str
 
     @classmethod
     def produce(
-        cls,
-        *,
-        run_dir: str,
-        dataset_con: Dict[str, Any]
+        cls, *, run_dir: str, dataset_con: Dict[str, Any]
     ) -> "SingleRunContext":
-
         run_directory = os.path.abspath(run_dir)
 
         summary_path = os.path.join(run_directory, "run_summary.json")
         algo_name = "unknown"
-        run_id = None 
+        run_id = None
 
         if os.path.exists(summary_path):
             with open(summary_path, "r") as f:
@@ -45,7 +43,11 @@ class SingleRunContext(Typed, Registry):
 
                 summary_config = summary.get("config", {})
 
-                algo_name = summary_config.get("algo_name") or summary_config.get("algorithm") or "unknown"
+                algo_name = (
+                    summary_config.get("algo_name")
+                    or summary_config.get("algorithm")
+                    or "unknown"
+                )
 
                 run_id = summary.get("run_id", None)
 
@@ -55,7 +57,7 @@ class SingleRunContext(Typed, Registry):
 
         unique_id = f"{algo_name}_{short_hash}"
 
-        dataset_config = dataset_con 
+        dataset_config = dataset_con
 
         return cls.of(
             algo_name=algo_name,
@@ -64,11 +66,10 @@ class SingleRunContext(Typed, Registry):
             run_id=run_id,
             dataset_config=dataset_config,
             prompts_dir=os.path.join(run_directory, "prompts"),
-            logs_path=os.path.join(run_directory, "run_logs.parquet"),
+            logs_path=os.path.join(run_directory, "run_logs"),
             summary_path=summary_path,
         )
 
-    
     # ---------------------------------------------------------
     # Filesystem checks
     # ---------------------------------------------------------
@@ -76,7 +77,10 @@ class SingleRunContext(Typed, Registry):
         return os.path.isdir(self.prompts_dir)
 
     def has_logs(self) -> bool:
-        return os.path.exists(self.logs_path)
+        if os.path.isdir(self.logs_path):
+            return len(os.listdir(self.logs_path)) > 0
+        legacy_path = self.logs_path + ".parquet"
+        return os.path.exists(legacy_path)
 
     def has_summary(self) -> bool:
         return os.path.exists(self.summary_path)
@@ -105,31 +109,27 @@ class SingleRunContext(Typed, Registry):
             return "initialized"
 
         return "not_started"
-    
+
 
 class ExptRunContext(Typed, Registry):
     """
-    Container Mapping: 
+    Container Mapping:
         algo_name -> SingleRunContext
     """
 
     _allow_subclass_override: ClassVar[bool] = True
     expt_dir: str
     dataset_config: Dict[str, Any]
-    runs: Dict[str, SingleRunContext] ## Key = unique_id for each SingleRunContext
+    runs: Dict[str, SingleRunContext]  ## Key = unique_id for each SingleRunContext
 
-    @classmethod 
+    @classmethod
     def build(
-        cls, 
-        *,
-        expt_dir: str,
-        dataset_configuration: Dict[str, Any]
-    ) -> "ExptRunContext": 
-
+        cls, *, expt_dir: str, dataset_configuration: Dict[str, Any]
+    ) -> "ExptRunContext":
         expt_dir = os.path.abspath(expt_dir)
-        dataset_config = dataset_configuration 
+        dataset_config = dataset_configuration
 
-        runs : Dict[str, SingleRunContext] = {} 
+        runs: Dict[str, SingleRunContext] = {}
         if os.path.isdir(expt_dir):
             # print(f"Found expt_dir: {expt_dir}")
             for item in os.listdir(expt_dir):
@@ -145,7 +145,7 @@ class ExptRunContext(Typed, Registry):
 
         else:
             print(f"{expt_dir} - Not found!")
-        
+
         return cls.of(
             expt_dir=expt_dir,
             dataset_config=dataset_config,
@@ -177,10 +177,10 @@ if __name__ == "__main__":
     dataset_config = {
         "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
         "task_output_formats": {
-            "fluency": "An integer between 1 to 5",                         # "1|2|3|4|5",
-            "coherence": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "relevance": "An integer between 1 to 5",                       # "1|2|3|4|5",
-            "consistency": "An integer between 1 to 5",                     # "1|2|3|4|5",
+            "fluency": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "coherence": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "relevance": "An integer between 1 to 5",  # "1|2|3|4|5",
+            "consistency": "An integer between 1 to 5",  # "1|2|3|4|5",
         },
         "task_losses": {
             "fluency": "accuracy",
