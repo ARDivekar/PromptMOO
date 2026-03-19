@@ -96,7 +96,7 @@ Open `.env` in a text editor and fill in your OpenRouter API key:
 OPENROUTER_API_KEY=sk-or-v1-your-key-here
 ```
 
-> **For demo reviewers:** An OpenRouter API key with pre-loaded credit is available in the [supplementary materials Google Drive folder](https://drive.google.com/drive/folders/1NgTUm-8XZZS23h6F7cY2mimJUfTV3bbi). Look for the file named `PromptMOO-Demo-OpenRouter-key.txt`. If you cannot access it, please contact the repository owner.
+> **To run the demo:** An OpenRouter API key with a small pre-loaded credit is available in the [supplementary materials Google Drive folder](https://drive.google.com/drive/folders/1NgTUm-8XZZS23h6F7cY2mimJUfTV3bbi). Look for the file named `PromptMOO-Demo-OpenRouter-key.txt`. If you cannot access it, please contact the repository owner.
 >
 > **Cost estimate:** A full experiment run (3 algorithms x 100 steps on SummEval) costs approximately **$5-10** on OpenRouter using the Llama 3.1 model configuration. A short test run (2 steps, batch_size=3) costs under $0.10.
 
