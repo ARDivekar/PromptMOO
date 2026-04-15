@@ -1,11 +1,11 @@
-import os, re, json, hashlib
-from typing import Dict, List, Optional, Union, Any, ClassVar
-from pydantic import BaseModel, Field, conint
-from morphic import Typed, Registry
+import hashlib
+import json
+import os
+from typing import Any, ClassVar, Dict, Optional
+
+from morphic import Registry, Typed
 
 # from morphic.string import hash as hash_str
-from .data_structures import Task
-from .data_input import Dataset
 
 
 class SingleRunContext(Typed, Registry):
@@ -28,8 +28,13 @@ class SingleRunContext(Typed, Registry):
     summary_path: str
 
     @classmethod
+    # @validate omitted: return type "SingleRunContext" is a forward reference
+    # that Pydantic's validate_call cannot resolve at class-definition time.
     def produce(
-        cls, *, run_dir: str, dataset_con: Dict[str, Any]
+        cls,
+        *,
+        run_dir: str,
+        dataset_config: Dict[str, Any],
     ) -> "SingleRunContext":
         run_directory = os.path.abspath(run_dir)
 
@@ -41,8 +46,21 @@ class SingleRunContext(Typed, Registry):
             with open(summary_path, "r") as f:
                 summary = json.load(f)
 
-                summary_config = summary.get("config", {})
+                if "config" not in summary:
+                    raise ValueError(
+                        f"Run summary at {summary_path} is missing 'config' key. "
+                        f"Available keys: {list(summary.keys())}."
+                    )
+                summary_config = summary["config"]
 
+                if (
+                    "algo_name" not in summary_config
+                    and "algorithm" not in summary_config
+                ):
+                    raise ValueError(
+                        f"Run summary config at {summary_path} is missing both 'algo_name' "
+                        f"and 'algorithm' keys. Available keys: {list(summary_config.keys())}."
+                    )
                 algo_name = (
                     summary_config.get("algo_name")
                     or summary_config.get("algorithm")
@@ -56,8 +74,6 @@ class SingleRunContext(Typed, Registry):
         short_hash = hashlib.md5(hash_input.encode()).hexdigest()[:6]
 
         unique_id = f"{algo_name}_{short_hash}"
-
-        dataset_config = dataset_con
 
         return cls.of(
             algo_name=algo_name,
@@ -123,6 +139,8 @@ class ExptRunContext(Typed, Registry):
     runs: Dict[str, SingleRunContext]  ## Key = unique_id for each SingleRunContext
 
     @classmethod
+    # @validate omitted: return type "ExptRunContext" is a forward reference
+    # that Pydantic's validate_call cannot resolve at class-definition time.
     def build(
         cls, *, expt_dir: str, dataset_configuration: Dict[str, Any]
     ) -> "ExptRunContext":
@@ -139,7 +157,7 @@ class ExptRunContext(Typed, Registry):
                     # print(f"Found run_dir: {run_dir}")
                     ctx = SingleRunContext.produce(
                         run_dir=run_dir,
-                        dataset_con=dataset_config,
+                        dataset_config=dataset_config,
                     )
                     runs[ctx.unique_id] = ctx
 
@@ -173,21 +191,15 @@ class ExptRunContext(Typed, Registry):
 
 
 if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, "expt")
+    from dataset import SummEval
+
     dir_path = "../outputs/1_t"
     dataset_config = {
-        "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
-        "task_output_formats": {
-            "fluency": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "coherence": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "relevance": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "consistency": "An integer between 1 to 5",  # "1|2|3|4|5",
-        },
-        "task_losses": {
-            "fluency": "accuracy",
-            "coherence": "accuracy",
-            "relevance": "accuracy",
-            "consistency": "accuracy",
-        },
+        "task_output_formats": SummEval.task_output_formats,
+        "task_losses": SummEval.task_losses,
     }
 
     ctx = ExptRunContext.build(

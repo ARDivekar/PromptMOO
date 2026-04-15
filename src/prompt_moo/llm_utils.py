@@ -1,9 +1,11 @@
 """Utilities for working with LLM worker instances in pipeline components."""
 
-from typing import Any, List
+from typing import List
+
+from .types import LLMPool
 
 
-def get_prompt_suffix(llm_pool: Any) -> str:
+def get_prompt_suffix(llm_pool: LLMPool) -> str:
     """Read the prompt suffix stored on an LLM worker (empty string if none).
 
     The suffix is set by ``runner.py`` at worker creation time via
@@ -14,7 +16,7 @@ def get_prompt_suffix(llm_pool: Any) -> str:
     return getattr(llm_pool, "_prompt_suffix", "")
 
 
-def apply_prompt_suffix(prompts: List[str], llm_pool: Any) -> List[str]:
+def apply_prompt_suffix(prompts: List[str], llm_pool: LLMPool) -> List[str]:
     """Append the worker's prompt suffix to every prompt string.
 
     Returns the original list unchanged if the suffix is empty.

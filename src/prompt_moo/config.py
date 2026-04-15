@@ -38,11 +38,13 @@ class PromptMOODefaults(MutableTyped):
     gradient_llm_max_tokens: conint(ge=1) = 2048
     loss_llm_max_tokens: conint(ge=1) = 256
 
-    # Temperature defaults per role
-    task_llm_temperature: confloat(ge=0.0, le=2.0) = 0.9
-    optimizer_llm_temperature: confloat(ge=0.0, le=2.0) = 0.9
-    gradient_llm_temperature: confloat(ge=0.0, le=2.0) = 0.9
-    loss_llm_temperature: confloat(ge=0.0, le=2.0) = 0.9
+    # Temperature defaults per role (fallback when the algorithm class does
+    # not specify a preference, i.e. leaves its temperature field as None).
+    # Values match the paper: task=0.1, optimizer/gradient/loss=0.7.
+    task_llm_temperature: confloat(ge=0.0, le=2.0) = 0.1
+    optimizer_llm_temperature: confloat(ge=0.0, le=2.0) = 0.7
+    gradient_llm_temperature: confloat(ge=0.0, le=2.0) = 0.7
+    loss_llm_temperature: confloat(ge=0.0, le=2.0) = 0.7
 
     # Shared rate limits (across all 4 LLM workers per experiment)
     max_parallel_calls: conint(ge=1) = 20

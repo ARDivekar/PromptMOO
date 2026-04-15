@@ -15,9 +15,12 @@ This module contains:
 - OptimizerResult: Result from prompt optimizer
 """
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from morphic import Typed
+
+from .context_manager import SingleRunContext, ExptRunContext
+from .metrics import Metric
 
 
 class Task(Typed):  # Subclassing Typed makes Task immutable
@@ -53,13 +56,6 @@ class Task(Typed):  # Subclassing Typed makes Task immutable
     def __str__(self) -> str:
         return f"Task name: {self.task_name}\nTask description: {self.task_description}\nTask instruction: {self.task_instruction}"
 
-    def to_dict(self) -> Dict[str, str]:
-        return {
-            "task_name": self.task_name,
-            "task_description": self.task_description,
-            "task_instruction": self.task_instruction,
-        }
-
 
 class DatasetSample(Typed):
     """Single sample from dataset with inputs and ground truths.
@@ -92,33 +88,68 @@ class PredictionResult(Typed):
 
     Attributes:
         sample_id: ID of the sample that was predicted
+        prompt: The prompt that was sent to the LLM
         task_outputs: Dictionary mapping task names to predicted values
         raw_response: Raw text response from LLM before parsing
-        prompt: The prompt that was sent to the LLM (for full observability)
+        parser_error: Error message if parsing failed, None if parsing succeeded
     """
 
     sample_id: str
+    prompt: str
     task_outputs: Dict[str, Any]
     raw_response: str
-    prompt: Optional[str] = None  # LLM input prompt
+    parser_error: Optional[str] = None
 
 
 class NumericFeedback(Typed):
     """Numeric loss/score for evaluation.
 
+    The ``metric`` field holds a ``Metric`` instance (e.g. ``Accuracy(value=0.71)``)
+    which is the single source of truth for the metric's name, optimization
+    direction, display formatting, and normalized score.
+
+    Delegation properties (``metric_name``, ``value``, ``optimization_direction``,
+    ``normalized_score``, ``display_score``) are provided so that all downstream
+    code that reads these attributes continues to work unchanged.
+
     Attributes:
-        task_name: Name of the task this feedback is for
-        metric_name: Name of the metric (e.g., "accuracy", "f1", "lce")
-        value: Numeric value of the metric
-        optimization_direction: Whether to maximize or minimize this metric
-        aggregated_from_samples: List of sample IDs this feedback was computed from
+        task_name: Name of the task this feedback is for.
+        metric: Metric instance holding the computed score.
+        aggregated_from_samples: List of sample IDs this feedback was computed from.
     """
 
     task_name: str
-    metric_name: str
-    value: float
-    optimization_direction: Literal["maximize", "minimize"]
+    metric: Metric
     aggregated_from_samples: List[str]
+
+    @property
+    def metric_name(self) -> str:
+        """Canonical metric name (e.g. ``"accuracy"``, ``"lce"``)."""
+        return self.metric.name
+
+    @property
+    def value(self) -> float:
+        """Raw numeric score."""
+        return self.metric.value
+
+    @property
+    def optimization_direction(self) -> str:
+        """``"maximize"`` or ``"minimize"``."""
+        return self.metric.optimization_direction
+
+    @property
+    def normalized_score(self) -> float:
+        """Return value oriented so that higher is always better."""
+        return self.metric.normalized_score
+
+    @property
+    def display_score(self) -> str:
+        """Format the score for display.
+
+        Delegates to the Metric subclass which knows how to format its
+        own values (e.g. Accuracy returns ``"70.8"``, LCE returns ``"0.342"``).
+        """
+        return self.metric.display_score
 
 
 class TextualFeedback(Typed):
@@ -181,7 +212,7 @@ class OptimizerResult(Typed):
         raw_response: The raw response from the optimizer LLM
     """
 
-    new_prompt: Any  # PromptTemplate - using Any to avoid circular import issues
+    new_prompt: "PromptTemplate"  # String annotation: avoids circular import with prompt_template
     meta_prompt: str
     raw_response: str
 
@@ -219,7 +250,7 @@ class AlgoMetricSeries(Typed):
     """
 
     algo_name: str
-    run_ctx: Any  # SingleRunContext - using Any to avoid circular import
+    run_ctx: Optional[SingleRunContext]
     split: str
     metric_name: str
     steps: List[StepMetricResult]
@@ -235,7 +266,7 @@ class ExptMetricReport(Typed):
         algo_reports: Mapping of algo_name -> AlgoMetricSeries.
     """
 
-    expt_ctx: Any  # ExptRunContext - using Any to avoid circular import
+    expt_ctx: Optional[ExptRunContext]
     split: str
     metric_name: str
     algo_reports: Dict[str, AlgoMetricSeries]
@@ -262,6 +293,4 @@ class StepMultiMetricResult(Typed):
     algo_name: str
     step: int
     split: str
-    task_metrics: List[
-        Any
-    ]  # TaskMetricResult - using Any to avoid circular import issues
+    task_metrics: List[TaskMetricResult]

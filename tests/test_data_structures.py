@@ -3,6 +3,7 @@ Unit tests for prompt_moo.data_structures.
 
 These are pure unit tests — no network calls, no API keys needed.
 """
+
 import pytest
 
 from prompt_moo.data_structures import (
@@ -16,6 +17,8 @@ from prompt_moo.data_structures import (
     TextGradient,
     TextualFeedback,
 )
+from prompt_moo.metrics import Accuracy
+from prompt_moo.prompt_template import PromptTemplate
 
 
 @pytest.mark.unit
@@ -34,32 +37,54 @@ class TestTask:
 
     def test_task_equality_by_name(self):
         """Tasks with the same name are equal, even with different instructions."""
-        t1 = Task(task_name="flu", task_description="d1", task_instruction="i1", gt_col="c1")
-        t2 = Task(task_name="flu", task_description="d2", task_instruction="i2", gt_col="c2")
+        t1 = Task(
+            task_name="flu", task_description="d1", task_instruction="i1", gt_col="c1"
+        )
+        t2 = Task(
+            task_name="flu", task_description="d2", task_instruction="i2", gt_col="c2"
+        )
         assert t1 == t2
 
     def test_task_inequality(self):
-        t1 = Task(task_name="flu", task_description="d", task_instruction="i", gt_col="c")
-        t2 = Task(task_name="coh", task_description="d", task_instruction="i", gt_col="c")
+        t1 = Task(
+            task_name="flu", task_description="d", task_instruction="i", gt_col="c"
+        )
+        t2 = Task(
+            task_name="coh", task_description="d", task_instruction="i", gt_col="c"
+        )
         assert t1 != t2
 
     def test_task_hashable(self):
         """Tasks can be used as dict keys and set members."""
-        t1 = Task(task_name="flu", task_description="d1", task_instruction="i1", gt_col="c1")
-        t2 = Task(task_name="flu", task_description="d2", task_instruction="i2", gt_col="c2")
+        t1 = Task(
+            task_name="flu", task_description="d1", task_instruction="i1", gt_col="c1"
+        )
+        t2 = Task(
+            task_name="flu", task_description="d2", task_instruction="i2", gt_col="c2"
+        )
         assert hash(t1) == hash(t2)
         assert len({t1, t2}) == 1
 
     def test_task_str(self):
-        task = Task(task_name="flu", task_description="desc", task_instruction="instr", gt_col="c")
+        task = Task(
+            task_name="flu",
+            task_description="desc",
+            task_instruction="instr",
+            gt_col="c",
+        )
         s = str(task)
         assert "flu" in s
         assert "desc" in s
         assert "instr" in s
 
-    def test_task_to_dict(self):
-        task = Task(task_name="flu", task_description="desc", task_instruction="instr", gt_col="c")
-        d = task.to_dict()
+    def test_task_model_dump(self):
+        task = Task(
+            task_name="flu",
+            task_description="desc",
+            task_instruction="instr",
+            gt_col="c",
+        )
+        d = task.model_dump()
         assert d["task_name"] == "flu"
         assert d["task_description"] == "desc"
         assert d["task_instruction"] == "instr"
@@ -82,7 +107,9 @@ class TestDatasetSample:
 class TestBatch:
     def test_create_batch(self):
         samples = [
-            DatasetSample(sample_id=f"s{i}", inputs={"x": i}, ground_truths={"y": i * 2})
+            DatasetSample(
+                sample_id=f"s{i}", inputs={"x": i}, ground_truths={"y": i * 2}
+            )
             for i in range(3)
         ]
         batch = Batch(step=0, samples=samples)
@@ -106,13 +133,15 @@ class TestPredictionResult:
         assert pred.task_outputs["fluency"] == 4
         assert pred.prompt == "evaluate this"
 
-    def test_prediction_without_prompt(self):
+    def test_prediction_parser_error_defaults_to_none(self):
         pred = PredictionResult(
             sample_id="s1",
+            prompt="test_prompt",
             task_outputs={"fluency": 5},
             raw_response="raw",
         )
-        assert pred.prompt is None
+        assert pred.prompt == "test_prompt"
+        assert pred.parser_error is None
 
 
 @pytest.mark.unit
@@ -120,13 +149,11 @@ class TestNumericFeedback:
     def test_create_numeric_feedback(self):
         fb = NumericFeedback(
             task_name="fluency",
-            metric_name="accuracy",
-            value=0.85,
-            optimization_direction="maximize",
+            metric=Accuracy(value=0.85),
             aggregated_from_samples=["s1", "s2", "s3"],
         )
-        assert fb.value == 0.85
-        assert fb.optimization_direction == "maximize"
+        assert fb.metric.value == 0.85
+        assert fb.metric.optimization_direction == "maximize"
         assert len(fb.aggregated_from_samples) == 3
 
 
@@ -147,12 +174,15 @@ class TestTextualFeedback:
 class TestCombinedFeedback:
     def test_create_combined(self):
         numeric = NumericFeedback(
-            task_name="flu", metric_name="acc", value=0.9,
-            optimization_direction="maximize", aggregated_from_samples=["s1"],
+            task_name="flu",
+            metric=Accuracy(value=0.9),
+            aggregated_from_samples=["s1"],
         )
         textual = TextualFeedback(
-            task_name="flu", feedback_text="Good grammar.",
-            aggregated_from_samples=["s1"], feedback_prompt="p",
+            task_name="flu",
+            feedback_text="Good grammar.",
+            aggregated_from_samples=["s1"],
+            feedback_prompt="p",
         )
         combined = CombinedFeedback(
             task_name="flu",
@@ -179,9 +209,14 @@ class TestTextGradient:
 @pytest.mark.unit
 class TestOptimizerResult:
     def test_create_optimizer_result(self):
+        prompt: PromptTemplate = PromptTemplate(
+            skeleton="Evaluate.",
+            tasks=[],
+            instruction={},
+        )
         result = OptimizerResult(
-            new_prompt="updated prompt object",
+            new_prompt=prompt,
             meta_prompt="meta prompt text",
             raw_response="raw optimizer response",
         )
-        assert result.new_prompt == "updated prompt object"
+        assert result.new_prompt == prompt

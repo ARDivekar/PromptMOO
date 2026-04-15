@@ -1,170 +1,375 @@
 """
 Prompt Trajectory: Tracks optimization history for algorithms like OPRO and GPO.
+
+Each trajectory element stores the prompt instructions and the
+``NumericFeedback`` objects that scored them (carrying their own
+``optimization_direction``).  The ``PromptTrajectory`` container
+maintains a heap ranked by a direction-aware, optionally task-weighted
+metric derived from the stored feedbacks.
+
+GPO's paper-faithful mode stores the **full** unbounded history (``k=None``)
+and retrieves the ``k`` most semantically similar entries at query time via
+``get_most_similar()``, using a sentence-transformer embedding model.
 """
 
 import heapq
-import json
-from typing import Any, Dict, List, Optional, Tuple, Union
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
-from morphic import Typed
+import numpy as np
+from morphic import Registry, Typed, validate
 from pydantic import PrivateAttr, conint
 
+from .data_structures import NumericFeedback
 
-class TrajectoryElement(Typed):
-    """Represents a single point in the optimization trajectory.
 
-    For OPRO, this tracks:
-    - The prompt instructions used
-    - The scores achieved
-    - The gradients computed
-    - Loss function metadata
+def _instructions_to_text(instructions: Union[str, Dict[str, str]]) -> str:
+    """Flatten instructions into a single string for embedding.
+
+    For multi-task dicts, concatenates ``task_name: instruction`` pairs
+    separated by newlines so the embedding captures all task content.
+    """
+    if isinstance(instructions, str):
+        return instructions
+    return "\n".join(
+        f"{task_name}: {instruction_text}"
+        for task_name, instruction_text in instructions.items()
+    )
+
+
+class TrajectoryElement(Typed, Registry, ABC):
+    """A single point in the optimization trajectory.
+
+    Abstract base class — algorithm-specific subclasses
+    (``OPROTrajectoryElement``, ``GPOTrajectoryElement``) must implement
+    ``__str__`` to render the element in the format expected by their
+    optimizer's meta-prompt.
+
+    Attributes:
+        instructions: The prompt instructions used at this trajectory step.
+            Either a single string or a dict mapping task_name -> instruction.
+        numeric_scores: Per-task numeric feedback objects.  Each
+            ``NumericFeedback`` carries its own ``optimization_direction``,
+            so the trajectory never needs to guess which way is "better".
     """
 
-    loss_fns: Dict[str, Any]  # Map of task_name -> loss function config
-    scores: Dict[str, Dict[str, float]]  # Map of task_name -> {metric: score}
-    grads: Dict[str, str]  # Map of task_name -> gradient text
-    instructions: Union[str, Dict[str, str]]  # Prompt instructions
+    _allow_subclass_override = True
 
-    def ranking_metric(self) -> float:
-        """Compute the combined ranking metric across all tasks.
+    instructions: Union[str, Dict[str, str]]
+    numeric_scores: Dict[str, List[NumericFeedback]]
 
-        For simplicity, we sum all scores. In OPRO, higher scores are better
-        (we use negative loss values, so higher = better).
+    @abstractmethod
+    def __str__(self) -> str:
+        """Render for inclusion in optimizer meta-prompts.
+
+        Subclasses must implement this to match their paper's trajectory
+        format (e.g. OPRO uses ``Instruction: .../Score: N``, GPO uses
+        ``Prompt: .../Score: N``).
+        """
+        pass
+
+    @validate
+    def ranking_key(
+        self,
+        *,
+        metric_priority: List[str],
+        task_weights: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, ...]:
+        """Compute a lexicographic ranking key for this element.
+
+        For each metric name in ``metric_priority`` (in order), computes
+        the weighted average of direction-normalized scores across tasks.
+        The result is a tuple suitable for Python's built-in tuple
+        comparison (first element is most significant).
+
+        Args:
+            metric_priority: Ordered list of metric names.  The first
+                metric is the primary sort key, the second is the
+                tiebreaker, etc.
+            task_weights: Optional mapping of task_name -> weight.
+                Weights must sum to 1.  When ``None``, all tasks
+                receive equal weight.
 
         Returns:
-            Combined metric for ranking (higher is better)
+            Tuple of floats (one per metric in priority order), where
+            higher is always better regardless of the original metric
+            direction.
         """
-        if len(self.scores) == 0:
-            return 0.0
+        if len(self.numeric_scores) == 0:
+            return tuple(0.0 for _ in metric_priority)
 
-        metric: float = 0.0
-        for _task_name, task_scores in self.scores.items():
-            # Sum all metrics for this task
-            # In the new architecture, numeric feedback is typically negative loss
-            # so higher values are better
-            metric += sum(task_scores.values())
+        task_names = list(self.numeric_scores.keys())
+        if task_weights is None:
+            n = len(task_names)
+            weights = {tn: 1.0 / n for tn in task_names}
+        else:
+            weights = task_weights
 
-        return metric
+        key_parts: List[float] = []
+        for metric_name in metric_priority:
+            weighted_sum = 0.0
+            for task_name, feedbacks in self.numeric_scores.items():
+                if task_name not in weights:
+                    raise ValueError(
+                        f"PromptTrajectoryEntry.sort_key: task {task_name!r} is present in "
+                        f"numeric_scores but has no weight in task_weights. "
+                        f"Provided weights for: {list(weights.keys())}. "
+                        f"Tasks in numeric_scores: {list(self.numeric_scores.keys())}."
+                    )
+                w = weights[task_name]
+                matching = [fb for fb in feedbacks if fb.metric_name == metric_name]
+                if len(matching) > 0:
+                    avg = sum(fb.normalized_score for fb in matching) / len(matching)
+                    weighted_sum += w * avg
+            key_parts.append(weighted_sum)
+
+        return tuple(key_parts)
 
     def __lt__(self, other: "TrajectoryElement") -> bool:
-        return self.ranking_metric() < other.ranking_metric()
-
-    def __le__(self, other: "TrajectoryElement") -> bool:
-        return self.ranking_metric() <= other.ranking_metric()
-
-    def __gt__(self, other: "TrajectoryElement") -> bool:
-        return self.ranking_metric() > other.ranking_metric()
-
-    def __ge__(self, other: "TrajectoryElement") -> bool:
-        return self.ranking_metric() >= other.ranking_metric()
+        raise NotImplementedError(
+            "TrajectoryElement comparison requires metric_priority context. "
+            "Use PromptTrajectory to manage ordering."
+        )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, TrajectoryElement):
             return NotImplemented
-        return self.ranking_metric() == other.ranking_metric()
+        return id(self) == id(other)
 
-    def __ne__(self, other: object) -> bool:
-        if not isinstance(other, TrajectoryElement):
-            return NotImplemented
-        return self.ranking_metric() != other.ranking_metric()
+    def __hash__(self) -> int:
+        return id(self)
 
 
 class PromptTrajectory(Typed):
-    """Maintains a top-k heap of trajectory elements for optimization history."""
+    """Maintains a heap of trajectory elements for optimization history.
 
-    k: conint(ge=1)
-    _heap: List[Tuple[float, TrajectoryElement]] = PrivateAttr(default_factory=list)
+    When ``k`` is an integer, the heap retains only the ``k`` elements with
+    the *highest* ranking keys (direction-aware, optionally weighted),
+    discarding lower-ranked elements as new ones are pushed.  This is the
+    behaviour used by OPRO (top-20 by score).
 
-    def _compute_metric(self, element: TrajectoryElement) -> float:
-        """Compute the value to push in the heap.
+    When ``k`` is ``None``, the heap grows unbounded — every pushed element
+    is retained.  This is the behaviour needed by GPO, which stores the
+    full optimization history and retrieves from it at query time via
+    ``get_most_similar()``.
 
-        Uses negative to simulate max-heap (higher rank_metric = better).
+    ``get_topk()`` returns elements sorted according to ``order``.
+
+    Args:
+        k: Maximum number of elements to retain, or ``None`` for unbounded
+            storage.  **Has no default** — callers must set it explicitly.
+        order: Sort order for ``get_topk()``.
+            ``"worst_to_best"``: ascending (OPRO recency-bias pattern).
+            ``"best_to_worst"``: descending.
+        metric_priority: Ordered list of metric names for lexicographic
+            ranking.  The first metric is the primary sort key.  Accepts
+            a single string (converted to a one-element list internally).
+        task_weights: Optional mapping of task_name -> weight (must sum
+            to 1.0).  ``None`` means equal weight across all tasks.
+        element_separator: String placed between consecutive elements in
+            ``get_top_k_str()`` output.  Default ``"\\n---\\n"`` matches
+            the GPO/OPRO papers' delimiter convention.
+    """
+
+    k: Optional[conint(ge=1)]
+    order: Literal["worst_to_best", "best_to_worst"]
+    metric_priority: Union[str, List[str]]
+    task_weights: Optional[Dict[str, float]] = None
+    element_separator: str = "\n---\n"
+
+    _heap: List[Tuple[Tuple[float, ...], int, TrajectoryElement]] = PrivateAttr(
+        default_factory=list
+    )
+    _push_counter: int = PrivateAttr(default=0)
+
+    # Embedding storage: maps push_counter -> L2-normalized embedding vector.
+    # Populated only when the caller passes embeddings via push().
+    # Using a dict (keyed by the unique push_counter) avoids the parallel-list
+    # desync problem that heapq rearrangement causes.
+    _embedding_by_id: Dict[int, np.ndarray] = PrivateAttr(default_factory=dict)
+
+    @classmethod
+    def pre_initialize(cls, data: dict) -> None:
+        mp = data.get("metric_priority")
+        if isinstance(mp, str):
+            data["metric_priority"] = [mp]
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.task_weights is not None:
+            total = sum(self.task_weights.values())
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError(
+                    f"task_weights must sum to 1.0, got {total:.6f}: {self.task_weights}"
+                )
+
+    def _ranking_key(self, element: TrajectoryElement) -> Tuple[float, ...]:
+        """Compute the ranking key used for heap ordering."""
+        return element.ranking_key(
+            metric_priority=self.metric_priority,
+            task_weights=self.task_weights,
+        )
+
+    @validate
+    def push(
+        self,
+        element: TrajectoryElement,
+        *,
+        embedding: Optional[np.ndarray] = None,
+    ) -> None:
+        """Push a new element, optionally maintaining top-k by ranking key.
+
+        When ``k`` is not ``None``, evicts the lowest-ranked element if
+        the heap exceeds ``k``.  When ``k`` is ``None``, the heap grows
+        unbounded.
 
         Args:
-            element: The trajectory element to compute metric for
-
-        Returns:
-            Negative ranking metric for min-heap ordering
+            element: The trajectory element to store.
+            embedding: Optional L2-normalized embedding vector for this
+                element's instructions.  Required for ``get_most_similar()``
+                to work.  When ``None``, similarity retrieval will skip
+                this element.
         """
-        return -element.ranking_metric()
+        found_metrics: Set = {
+            fb.metric_name for fbs in element.numeric_scores.values() for fb in fbs
+        }
+        missing: Set = set(self.metric_priority) - found_metrics
+        if len(missing) > 0 and len(found_metrics) > 0:
+            raise ValueError(
+                f"metric_priority references metrics {sorted(missing)} "
+                f"not found in element. Available metrics: {sorted(found_metrics)}. "
+                f"Set metric_priority to match the metrics your loss computer produces."
+            )
 
-    def push(self, element: TrajectoryElement) -> None:
-        """Push a new element into the heap and maintain top-k.
+        key: Tuple[float, ...] = self._ranking_key(element)
+        self._push_counter += 1
+        push_id = self._push_counter
+        heapq.heappush(self._heap, (key, push_id, element))
+
+        if embedding is not None:
+            self._embedding_by_id[push_id] = embedding
+
+        if self.k is not None and len(self._heap) > self.k:
+            evicted = heapq.heappop(self._heap)
+            evicted_id = evicted[1]
+            self._embedding_by_id.pop(evicted_id, None)
+
+    @validate
+    def get_topk(self, *, limit: Optional[int] = None) -> List[TrajectoryElement]:
+        """Return elements sorted according to ``self.order``.
+
+        ``"worst_to_best"``: ascending ranking key (worst first, best last).
+        ``"best_to_worst"``: descending ranking key (best first, worst last).
 
         Args:
-            element: The trajectory element to add
+            limit: Maximum number of elements to return.  ``None`` returns all.
+                When the heap is larger than ``limit``, the top-ranked elements
+                (highest ranking keys) are selected first, then sorted according
+                to ``self.order``.
         """
-        metric = self._compute_metric(element)
-        heapq.heappush(self._heap, (metric, element))
-        if len(self._heap) > self.k:
-            heapq.heappop(self._heap)
+        ascending = self.order == "worst_to_best"
 
-    def get_topk(self) -> List[TrajectoryElement]:
-        """Return elements sorted by descending ranking metric.
+        if limit is not None and len(self._heap) > limit:
+            top_items = heapq.nlargest(limit, self._heap, key=lambda x: x[0])
+            sorted_items = sorted(top_items, key=lambda x: x[0], reverse=not ascending)
+        else:
+            sorted_items = sorted(self._heap, key=lambda x: x[0], reverse=not ascending)
+
+        return [elem for _key, _cnt, elem in sorted_items]
+
+    @validate
+    def get_most_similar(
+        self,
+        *,
+        query_embedding: np.ndarray,
+        limit: int,
+    ) -> List[TrajectoryElement]:
+        """Retrieve the ``limit`` most semantically similar elements.
+
+        Computes cosine similarity between ``query_embedding`` and the stored
+        embeddings (both must be L2-normalized, so similarity = dot product).
+        Returns elements sorted in **ascending** similarity order: least
+        similar first, most similar last.  This matches the GPO paper's
+        meta-prompt structure where the most relevant prompts appear closest
+        to the generation instruction.
+
+        Elements pushed without an embedding are skipped.
+
+        Args:
+            query_embedding: L2-normalized embedding of the current prompt.
+            limit: Maximum number of elements to return.
 
         Returns:
-            List of top-k elements, best first
+            List of TrajectoryElement sorted by ascending similarity.
+
+        Raises:
+            ValueError: If no elements have embeddings.
         """
-        return [e for _, e in sorted(self._heap, key=lambda x: x[0])]
+        if len(self._heap) == 0:
+            return []
+
+        scored: List[Tuple[float, int, TrajectoryElement]] = []
+        for rank_key, push_idx, element in self._heap:
+            emb = self._embedding_by_id.get(push_idx)
+            if emb is None:
+                continue
+            similarity = float(np.dot(query_embedding, emb))
+            scored.append((similarity, push_idx, element))
+
+        if len(scored) == 0:
+            return []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_scored = scored[:limit]
+
+        top_scored.sort(key=lambda x: x[0])
+        return [elem for _sim, _idx, elem in top_scored]
 
     def __len__(self) -> int:
-        """Return the number of elements in the trajectory."""
         return len(self._heap)
 
-    def get_top_k_str(self) -> str:
-        """Return a string representation of the top-k elements.
+    def to_serializable_list(
+        self,
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Serialize trajectory elements for observability logging.
+
+        Each element is converted to a plain dict with ``instructions``,
+        ``numeric_scores`` (model_dumped), and ``ranking_key``.  The
+        algorithm calls this and passes the result to
+        ``observer.record()`` — the observer never touches trajectory
+        internals.
+
+        Args:
+            limit: Maximum number of elements.  ``None`` returns all.
 
         Returns:
-            Newline-separated string of trajectory elements
+            List of JSON-serializable dicts, one per trajectory element.
         """
-        return "\n".join([str(e) for e in self.get_topk()])
+        return [
+            {
+                "instructions": elem.instructions,
+                "numeric_scores": {
+                    task_name: [fb.model_dump() for fb in feedbacks]
+                    for task_name, feedbacks in elem.numeric_scores.items()
+                },
+                "ranking_key": list(self._ranking_key(elem)),
+            }
+            for elem in self.get_topk(limit=limit)
+        ]
 
+    def get_top_k_str(
+        self,
+        *,
+        limit: Optional[int] = None,
+        separator: Optional[str] = None,
+    ) -> str:
+        """Joined ``str()`` of elements in ``get_topk()`` order.
 
-class OPROTrajectoryElement(TrajectoryElement):
-    """OPRO-specific trajectory element - uses score as the only gradient signal."""
-
-    def __str__(self) -> str:
-        ## Only show scores and instructions
-        lines = []
-        lines.append(
-            "Instructions: "
-            + (
-                self.instructions
-                if isinstance(self.instructions, str)
-                else json.dumps(self.instructions)
-            )
-        )
-        lines.append("Scores:")
-        for task_name, task_scores in self.scores.items():
-            for metric_name, value in task_scores.items():
-                lines.append(f"  {task_name} ({metric_name}): {value:.4f}")
-        return "\n".join(lines)
-
-
-class GPOTrajectoryElement(TrajectoryElement):
-    """GPO-specific trajectory element - includes textual and numerical gradients."""
-
-    text_grads: List[str] = []
-    numerical_grads: Optional[str] = None
-
-    def __str__(self) -> str:
-        lines = []
-        lines.append(
-            "Instructions: "
-            + (
-                self.instructions
-                if isinstance(self.instructions, str)
-                else json.dumps(self.instructions)
-            )
-        )
-        lines.append("Scores:")
-        for task_name, task_scores in self.scores.items():
-            for metric, value in task_scores.items():
-                lines.append(f"  {task_name} - {metric}: {value:.4f}")
-        if self.text_grads:
-            lines.append(f"Textual Gradients ({len(self.text_grads)}):")
-            for i, grad in enumerate(self.text_grads, 1):
-                lines.append(f"  {i}. {grad}...")  # Truncate for readability
-        if self.numerical_grads:
-            lines.append(f"Numerical Gradient: {self.numerical_grads}")
-        return "\n".join(lines)
+        Args:
+            limit: Maximum number of elements.  ``None`` returns all.
+            separator: String placed between consecutive elements.
+                When ``None``, uses ``self.element_separator``.
+        """
+        sep = separator if separator is not None else self.element_separator
+        return sep.join([str(e) for e in self.get_topk(limit=limit)])

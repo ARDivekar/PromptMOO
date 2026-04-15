@@ -5,20 +5,23 @@ This is Step 3 of the optimization pipeline.
 """
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
-from morphic import Registry, Typed
+from morphic import Registry, Typed, validate
+from morphic.typed import format_exception_msg
 
 from .config import promptmoo_config
 from .data_structures import (
-    CombinedFeedback,
+    DatasetSample,
     NumericFeedback,
+    PredictionResult,
     Task,
     TextGradient,
     TextualFeedback,
 )
 from .llm_utils import apply_prompt_suffix
-from .prompt_template_utils import PromptTemplate
+from .prompt_template import PromptTemplate
 
 # Export validator for use when creating LLM pools
 __all__ = [
@@ -59,10 +62,16 @@ class GradientComputer(Typed, Registry, ABC):
         feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
         prompt_template: PromptTemplate,
         tasks: List[Task],
-        llm_pool: Optional[Any],
+        llm_pool: Any,  # LLMPool protocol; see types.py
         gradient_batch_size: int,
         verbosity: int = 1,
-        **kwargs: Dict,
+        *,
+        use_textual_feedback: bool = False,
+        predictions: Optional[List[PredictionResult]] = None,
+        ground_truths: Optional[List[DatasetSample]] = None,
+        input_col_labels: Optional[Dict[str, str]] = None,
+        gradient_task_strategy: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[Task, List[TextGradient]]:
         """Compute text gradients from feedbacks.
 
@@ -73,7 +82,12 @@ class GradientComputer(Typed, Registry, ABC):
             llm_pool: LLM pool for gradient generation
             gradient_batch_size: Batch size for grouping feedbacks
             verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Algorithm-specific context
+            use_textual_feedback: Whether to use textual feedback for gradient generation
+            predictions: List of prediction results (used by TextGrad, PE2)
+            ground_truths: List of ground truth samples (used by TextGrad, PE2)
+            input_col_labels: Mapping of column names to display labels (used by TextGrad, PE2)
+            gradient_task_strategy: Multi-task gradient strategy (used by TextGrad)
+            **kwargs: Algorithm-specific context (e.g. PE2 conversation state)
 
         Returns:
             Dict with:
@@ -100,7 +114,7 @@ class GradientComputer(Typed, Registry, ABC):
         if batch_size <= 0:
             return [feedbacks]
 
-        batches = []
+        batches: List[List[Union[NumericFeedback, TextualFeedback]]] = []
         for i in range(0, len(feedbacks), batch_size):
             batches.append(feedbacks[i : i + batch_size])
         return batches
@@ -111,15 +125,22 @@ class StandardGradientComputer(GradientComputer):
 
     aliases = ["standard", "default"]
 
+    @validate
     def compute(
         self,
         feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
         prompt_template: PromptTemplate,
         tasks: List[Task],
-        llm_pool: Any,
+        llm_pool: Any,  # LLMPool protocol; see types.py
         gradient_batch_size: int,
         verbosity: int = 1,
-        **kwargs,
+        *,
+        use_textual_feedback: bool = False,
+        predictions: Optional[List[PredictionResult]] = None,
+        ground_truths: Optional[List[DatasetSample]] = None,
+        input_col_labels: Optional[Dict[str, str]] = None,
+        gradient_task_strategy: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[Task, List[TextGradient]]:
         """Compute gradients using LLM for improvement suggestions.
 
@@ -130,27 +151,34 @@ class StandardGradientComputer(GradientComputer):
             llm_pool: LLM pool
             gradient_batch_size: Gradient batch size
             verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Unused
+            use_textual_feedback: Whether to use textual feedback (unused)
+            predictions: Prediction results (unused)
+            ground_truths: Ground truth samples (unused)
+            input_col_labels: Column label mapping (unused)
+            gradient_task_strategy: Multi-task strategy (unused)
+            **kwargs: Absorbed for interface compatibility
 
         Returns:
             Dict mapping task keys to text gradients
         """
-        result = {}
+        result: Dict[Task, List[TextGradient]] = {}
 
         for task, feedback_list in feedbacks.items():
             if len(feedback_list) == 0:
                 continue
 
             # Batch feedbacks for gradient computation
-            feedback_batches = self._batch_feedbacks(
-                feedbacks=feedback_list,
-                batch_size=gradient_batch_size,
+            feedback_batches: List[List[Union[NumericFeedback, TextualFeedback]]] = (
+                self._batch_feedbacks(
+                    feedbacks=feedback_list,
+                    batch_size=gradient_batch_size,
+                )
             )
 
             # Build all gradient prompts first
-            prompts = []
+            prompts: List[str] = []
             for fb_batch in feedback_batches:
-                grad_prompt = self._build_gradient_prompt(
+                grad_prompt: str = self._build_gradient_prompt(
                     feedbacks=fb_batch,
                     task=task,
                     prompt_template=prompt_template,
@@ -159,30 +187,33 @@ class StandardGradientComputer(GradientComputer):
                 prompts.append(grad_prompt)
 
             # Call LLM with all prompts in a single batch
-            gradients = []
+            gradients: List[TextGradient] = []
             if len(prompts) > 0:
                 try:
                     prompts = apply_prompt_suffix(prompts, llm_pool)
-                    responses = llm_pool.call_llm_batch(
+                    responses: List[str] = llm_pool.call_llm_batch(
                         prompts=prompts, verbosity=verbosity
                     ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
 
-                    for fb_batch, response in zip(feedback_batches, responses):
-                        # Create TextGradient
-                        feedback_ids = []
+                    for fb_batch, prompt, response in zip(
+                        feedback_batches, prompts, responses
+                    ):
+                        feedback_ids: List[str] = []
                         for fb in fb_batch:
                             feedback_ids.extend(fb.aggregated_from_samples)
 
-                        gradient = TextGradient(
+                        gradient: TextGradient = TextGradient(
                             task_name=task.task_name,
                             gradient_text=response,
                             based_on_feedbacks=feedback_ids,
-                            gradient_prompt=None,  # Not storing prompt for brevity
+                            gradient_prompt=prompt,
                         )
                         gradients.append(gradient)
-                except Exception:
-                    # Skip all batches on error
-                    pass
+                except (RuntimeError, TimeoutError, ValueError) as e:
+                    raise RuntimeError(
+                        f"{self.__class__.__name__}: gradient LLM call "
+                        f"failed for task {task.task_name}:\n{format_exception_msg(e)}"
+                    ) from e
 
             result[task] = gradients
 
@@ -198,6 +229,9 @@ class StandardGradientComputer(GradientComputer):
     ) -> str:
         """Build prompt for gradient computation.
 
+        Groups feedback by sample batch so the gradient LLM can see which
+        metrics and critiques correspond to which examples.
+
         Args:
             feedbacks: Batch of feedbacks
             task: Task object
@@ -207,433 +241,33 @@ class StandardGradientComputer(GradientComputer):
         Returns:
             Prompt string for gradient generation
         """
-        prompt = f"""You are given feedback on the performance of a task: {task.task_name}
-
-Current prompt template instructions:
-{prompt_template.to_str()}
-
-Feedback on performance:
-"""
-
+        groups: OrderedDict[frozenset, Dict[str, list]] = OrderedDict()
         for fb in feedbacks:
+            key: frozenset = frozenset(fb.aggregated_from_samples)
+            if key not in groups:
+                groups[key] = {"samples": list(key), "items": []}
             if isinstance(fb, NumericFeedback):
-                prompt += f"- {fb.metric_name}: {fb.value:.4f} ({fb.optimization_direction})\n"
+                groups[key]["items"].append(
+                    f"  - {fb.metric_name}: {fb.value:.4f} ({fb.optimization_direction})"
+                )
             elif isinstance(fb, TextualFeedback):
-                prompt += f"- {fb.feedback_text}\n"
+                groups[key]["items"].append(f"  - Textual: {fb.feedback_text}")
 
-        prompt += """
-Based on this feedback, suggest how to improve the instructions for this task.
-Provide 2-3 specific suggestions for improvement:
-"""
-        return prompt
+        feedback_sections: List[str] = []
+        for i, (key, group) in enumerate(groups.items(), 1):
+            header: str = f"Batch {i} (samples: {', '.join(group['samples'])}):"
+            feedback_sections.append(header + "\n" + "\n".join(group["items"]))
 
+        prompt: str = f"""You are given feedback on the performance of a task: {task.task_name}
 
-class OPROGradientComputer(GradientComputer):
-    """OPRO: No gradients, just pass through numeric scores as summary."""
+Current prompt template:
+{prompt_template.render_instructions()}
 
-    aliases = ["opro"]
+Feedback on performance (grouped by sample batch):
+{chr(10).join(feedback_sections) if len(feedback_sections) > 0 else "None"}
 
-    def compute(
-        self,
-        feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
-        prompt_template: PromptTemplate,
-        tasks: List[Task],
-        llm_pool: Any,
-        gradient_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[TextGradient]]:
-        """Convert numeric feedbacks to summary gradients (no LLM calls).
-
-        OPRO doesn't use text gradients in the traditional sense - it uses
-        the trajectory of prompt-score pairs. This just creates a summary.
-
-        Args:
-            feedbacks: Feedbacks from loss computer
-            prompt_template: Current prompt (unused)
-            tasks: List of tasks (unused)
-            llm_pool: LLM pool (unused)
-            gradient_batch_size: Batch size (unused - OPRO aggregates all feedbacks)
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Unused
-
-        Returns:
-            Dict mapping task keys to summary gradients
-        """
-        result = {}
-
-        for task, feedback_list in feedbacks.items():
-            # Extract numeric scores from all feedbacks
-            scores = []
-            for fb in feedback_list:
-                if isinstance(fb, NumericFeedback):
-                    scores.append(fb.value)
-
-            if len(scores) > 0:
-                avg_score = sum(scores) / len(scores)
-
-                gradient = TextGradient(
-                    task_name=task.task_name,
-                    gradient_text=f"Average score: {avg_score:.4f}",
-                    based_on_feedbacks=[],
-                    gradient_prompt=None,
-                )
-                result[task] = [gradient]
-            else:
-                result[task] = []
-
-        return result
-
-
-class GPOGradientComputer(GradientComputer):
-    """GPO GradientComputer: Generate textual gradients for candidate prompts using feedbacks."""
-
-    aliases = ["gpo"]
-
-    def compute(
-        self,
-        feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
-        prompt_template: PromptTemplate,
-        tasks: List[Task],
-        llm_pool: Any,
-        gradient_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[TextGradient]]:
-        """Compute GPO-style gradients from feedbacks.
-
-        Args:
-            feedbacks: Feedbacks from loss computer
-            prompt_template: Current prompt
-            tasks: Task definitions
-            llm_pool: LLM pool to generate textual gradients
-            gradient_batch_size: Number of feedbacks per gradient computation
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Algorithm-specific context (e.g., trajectory)
-
-        Returns:
-            Dict mapping task keys to lists of TextGradient
-        """
-        result = {}
-
-        for task, feedback_list in feedbacks.items():
-            if len(feedback_list) == 0:
-                result[task] = []
-                continue
-
-            # Combine numeric and textual feedbacks with the same samples
-            combined_feedbacks = self._combine_feedbacks_by_samples(
-                feedbacks=feedback_list, task=task
-            )
-
-            # Batch combined feedbacks for gradient computation
-            feedback_batches = self._batch_combined_feedbacks(
-                feedbacks=combined_feedbacks, batch_size=gradient_batch_size
-            )
-
-            # Build all gradient prompts first
-            prompts = []
-            for fb_batch in feedback_batches:
-                grad_prompt = self._build_gradient_prompt(
-                    feedbacks=fb_batch,
-                    task=task,
-                    prompt_template=prompt_template,
-                    tasks=tasks,
-                )
-                prompts.append(grad_prompt)
-
-            # Call LLM with all prompts in a single batch
-            gradients = []
-            if len(prompts) > 0:
-                try:
-                    prompts = apply_prompt_suffix(prompts, llm_pool)
-                    responses = llm_pool.call_llm_batch(
-                        prompts=prompts, verbosity=verbosity
-                    ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
-
-                    for fb_batch, response in zip(feedback_batches, responses):
-                        # Aggregate feedback IDs from all combined feedbacks
-                        feedback_ids = []
-                        for combined_fb in fb_batch:
-                            if len(combined_fb.aggregated_from_samples) > 0:
-                                feedback_ids.extend(combined_fb.aggregated_from_samples)
-
-                        # Create and store the gradient
-                        gradient = TextGradient(
-                            task_name=task.task_name,
-                            gradient_text=response,
-                            based_on_feedbacks=feedback_ids,
-                            gradient_prompt=None,  # Not storing prompt for brevity
-                        )
-                        gradients.append(gradient)
-                except Exception as e:
-                    print(
-                        f"[WARN] Failed to compute gradient for {task.task_name}: {e}"
-                    )
-
-            result[task] = gradients
-
-        return result
-
-    def _combine_feedbacks_by_samples(
-        self,
-        *,
-        feedbacks: List[Union[NumericFeedback, TextualFeedback]],
-        task: Task,
-    ) -> List[CombinedFeedback]:
-        """Combine numeric and textual feedbacks that share the same samples.
-
-        GPO computes both numeric metrics and textual feedback on the same batches
-        of samples. This method groups them together so they can be used to generate
-        a single coherent gradient.
-
-        Args:
-            feedbacks: List of numeric and textual feedbacks
-            task: Task object
-
-        Returns:
-            List of CombinedFeedback objects, each representing feedbacks for a
-            unique set of samples
-        """
-        # Group feedbacks by their sample sets (using frozenset for hashability)
-        sample_groups: Dict[frozenset, Dict[str, List]] = {}
-
-        for fb in feedbacks:
-            sample_key = frozenset(fb.aggregated_from_samples)
-
-            if sample_key not in sample_groups:
-                sample_groups[sample_key] = {
-                    "numeric": [],
-                    "textual": [],
-                    "samples": list(sample_key),
-                }
-
-            if isinstance(fb, NumericFeedback):
-                sample_groups[sample_key]["numeric"].append(fb)
-            elif isinstance(fb, TextualFeedback):
-                sample_groups[sample_key]["textual"].append(fb)
-
-        # Create CombinedFeedback objects
-        combined = []
-        for sample_key, group in sample_groups.items():
-            combined.append(
-                CombinedFeedback(
-                    task_name=task.task_name,
-                    numeric_feedbacks=group["numeric"],
-                    textual_feedbacks=group["textual"],
-                    aggregated_from_samples=group["samples"],
-                )
-            )
-
-        return combined
-
-    def _batch_combined_feedbacks(
-        self,
-        *,
-        feedbacks: List[CombinedFeedback],
-        batch_size: int,
-    ) -> List[List[CombinedFeedback]]:
-        """Batch combined feedbacks into groups.
-
-        Args:
-            feedbacks: List of CombinedFeedback objects
-            batch_size: Size of each batch
-
-        Returns:
-            List of CombinedFeedback batches
-        """
-        if batch_size <= 0:
-            return [feedbacks]
-
-        batches = []
-        for i in range(0, len(feedbacks), batch_size):
-            batches.append(feedbacks[i : i + batch_size])
-        return batches
-
-    def _build_gradient_prompt(
-        self,
-        *,
-        feedbacks: List[CombinedFeedback],
-        task: Task,
-        prompt_template: PromptTemplate,
-        tasks: List[Task],
-    ) -> str:
-        """
-        Build a prompt for the LLM to generate text gradients for a task.
-
-        Args:
-            feedbacks: Batch of CombinedFeedback objects (numeric + textual)
-            task: Task object
-            prompt_template: Current prompt template
-            tasks: List of all tasks
-
-        Returns:
-            A string prompt for gradient generation
-        """
-        # Extract numeric and textual feedback from combined feedbacks
-        numeric_summary = []
-        textual_summary = []
-
-        for combined_fb in feedbacks:
-            # Add all numeric feedbacks
-            for nf in combined_fb.numeric_feedbacks:
-                numeric_summary.append(
-                    f"- {nf.metric_name}: {nf.value:.4f} ({nf.optimization_direction})"
-                )
-            # Add all textual feedbacks
-            for tf in combined_fb.textual_feedbacks:
-                textual_summary.append(f"- {tf.feedback_text}")
-
-        prompt = f"""You are optimizing the task: {task.task_name}
-
-Current prompt instructions:
-{prompt_template.to_str()}
-
-Feedback on performance:
-Numeric feedback:
-{chr(10).join(numeric_summary) if len(numeric_summary) > 0 else "None"}
-
-Textual feedback:
-{chr(10).join(textual_summary) if len(textual_summary) > 0 else "None"}
-
-Based on this feedback, suggest how to update or improve the instructions for this task.
-Focus on clarity, correctness, and alignment with the intended goal.
-Return a concise improvement suggestion in plain text.
-"""
-        return prompt
-
-
-class TextGradGradientComputer(GradientComputer):
-    """
-    TextGrad-specific Gradient Computer:
-    - Generates textual gradients from textual feedback only
-    - Uses LLM to refine and structure feedback into actionable improvement suggestions
-    """
-
-    aliases = ["textgrad"]
-
-    def compute(
-        self,
-        feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
-        prompt_template: PromptTemplate,
-        tasks: List[Task],
-        llm_pool: Any,
-        gradient_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[TextGradient]]:
-        """
-        Compute TextGrad-style gradients from textual feedbacks.
-
-        Args:
-            feedbacks: Textual feedbacks from loss computer
-            prompt_template: Current prompt
-            tasks: Task definitions
-            llm_pool: LLM pool to generate textual gradients
-            gradient_batch_size: Number of feedbacks per gradient computation
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Algorithm-specific context
-
-        Returns:
-            Dict mapping task keys to lists of TextGradient
-        """
-        result = {}
-
-        for task, feedback_list in feedbacks.items():
-            if len(feedback_list) == 0:
-                result[task] = []
-                continue
-
-            # Batch feedbacks for gradient computation
-            feedback_batches = self._batch_feedbacks(
-                feedbacks=feedback_list,
-                batch_size=gradient_batch_size,
-            )
-
-            # Build all gradient prompts first
-            prompts = []
-            for fb_batch in feedback_batches:
-                grad_prompt = self._build_gradient_prompt(
-                    feedbacks=fb_batch,
-                    task=task,
-                    prompt_template=prompt_template,
-                    tasks=tasks,
-                )
-                prompts.append(grad_prompt)
-
-            # Call LLM with all prompts in a single batch
-            gradients = []
-            if len(prompts) > 0:
-                try:
-                    prompts = apply_prompt_suffix(prompts, llm_pool)
-                    responses = llm_pool.call_llm_batch(
-                        prompts=prompts, verbosity=verbosity
-                    ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
-
-                    for fb_batch, response in zip(feedback_batches, responses):
-                        # Aggregate feedback IDs
-                        feedback_ids = []
-                        for fb in fb_batch:
-                            if len(fb.aggregated_from_samples) > 0:
-                                feedback_ids.extend(fb.aggregated_from_samples)
-
-                        # Create and store the gradient
-                        gradient = TextGradient(
-                            task_name=task.task_name,
-                            gradient_text=response,
-                            based_on_feedbacks=feedback_ids,
-                            gradient_prompt=None,  # Not storing prompt for brevity
-                        )
-                        gradients.append(gradient)
-                except Exception as e:
-                    print(
-                        f"[WARN] Failed to compute gradient for {task.task_name}: {e}"
-                    )
-
-            result[task] = gradients
-
-        return result
-
-    def _build_gradient_prompt(
-        self,
-        *,
-        feedbacks: List[Union[NumericFeedback, TextualFeedback]],
-        task: Task,
-        prompt_template: PromptTemplate,
-        tasks: List[Task],
-    ) -> str:
-        """
-        Build a prompt for the LLM to generate text gradients for a task.
-
-        For TextGrad, we only use textual feedback (no numeric metrics).
-
-        Args:
-            feedbacks: Batch of feedbacks (should be textual only)
-            task: Task object
-            prompt_template: Current prompt template
-            tasks: List of all tasks
-
-        Returns:
-            A string prompt for gradient generation
-        """
-        # Extract only textual feedback (TextGrad doesn't use numeric)
-        textual_summary = [
-            f"- {fb.feedback_text}"
-            for fb in feedbacks
-            if isinstance(fb, TextualFeedback)
-        ]
-
-        prompt = f"""You are optimizing the task: {task.task_name}
-
-Current prompt instructions:
-{prompt_template.to_str()}
-
-Textual feedback on performance:
-{chr(10).join(textual_summary) if textual_summary else "No feedback available"}
-
-Based on this textual feedback, suggest how to update or improve the instructions for this task.
-Focus on addressing the specific issues mentioned in the feedback.
-Provide clear, actionable suggestions for improving clarity, correctness, and effectiveness.
-Return a concise improvement suggestion in plain text.
+Based on this feedback, write the specific sentences or phrases that should be added to, removed from, or changed in the current task instruction.
+Do not give abstract advice (e.g. "add more detail"). Instead, write the concrete instruction text that would fix the identified issues.
+Provide 2-3 specific, ready-to-use instruction edits:
 """
         return prompt

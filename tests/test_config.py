@@ -9,6 +9,7 @@ Covers:
 - reset_to_defaults restores original values
 - Pydantic validation rejects invalid values
 """
+
 import pytest
 
 from prompt_moo.config import (
@@ -43,10 +44,10 @@ class TestPromptMOODefaults:
 
     def test_per_role_temperature_defaults(self):
         d = PromptMOODefaults()
-        assert d.task_llm_temperature == 0.9
-        assert d.optimizer_llm_temperature == 0.9
-        assert d.gradient_llm_temperature == 0.9
-        assert d.loss_llm_temperature == 0.9
+        assert d.task_llm_temperature == 0.1
+        assert d.optimizer_llm_temperature == 0.7
+        assert d.gradient_llm_temperature == 0.7
+        assert d.loss_llm_temperature == 0.7
 
     def test_rate_limit_defaults(self):
         d = PromptMOODefaults()

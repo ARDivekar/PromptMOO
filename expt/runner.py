@@ -48,7 +48,7 @@ from prompt_moo.algorithm import GPO, OPRO, TextGrad
 from prompt_moo.config import promptmoo_config
 from prompt_moo.data_input import Dataset
 from prompt_moo.data_structures import Task
-from prompt_moo.prompt_template_utils import PromptTemplate
+from prompt_moo.prompt_template import PromptTemplate
 from prompt_moo.task_predictor import parse_task_response
 
 
@@ -264,6 +264,7 @@ def _build_retry_config(*, cfg: Any) -> Dict[str, Any]:
     )
 
 
+@validate
 def create_shared_limits() -> BaseLimitSet:
     """Create shared LimitSet for all LLM workers.
 
@@ -291,7 +292,12 @@ def create_shared_limits() -> BaseLimitSet:
 
 @validate
 def create_task_llm(
-    *, llm: str, api_key: str, limits: BaseLimitSet, reasoning: bool = False
+    *,
+    llm: str,
+    api_key: str,
+    limits: BaseLimitSet,
+    reasoning: bool = False,
+    temperature: Optional[float] = None,
 ) -> SlowBurnLLM:
     """Create task LLM using SlowBurnLLM.
 
@@ -300,6 +306,8 @@ def create_task_llm(
         api_key: API key for LLM service.
         limits: Shared LimitSet for rate limiting.
         reasoning: Enable reasoning/thinking mode. Adds REASONING_EXTRA_TOKENS to max_tokens.
+        temperature: Explicit temperature override from the algorithm class.
+            When ``None``, falls back to ``promptmoo_config.defaults.task_llm_temperature``.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
@@ -313,6 +321,9 @@ def create_task_llm(
     if reasoning and _detect_reasoning_family(model_name) is not None:
         max_tokens += REASONING_EXTRA_TOKENS
 
+    resolved_temperature = (
+        temperature if temperature is not None else cfg.task_llm_temperature
+    )
     llm = SlowBurnLLM.options(
         mode="asyncio",
         limits=limits,
@@ -321,7 +332,7 @@ def create_task_llm(
         name="task_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=cfg.task_llm_temperature,
+        temperature=resolved_temperature,
         max_tokens=max_tokens,
         timeout=cfg.task_llm_timeout,
         litellm_params=_build_litellm_params(
@@ -336,7 +347,11 @@ def create_task_llm(
 
 @validate
 def create_optimizer_llm(
-    *, llm: str, api_key: str, limits: BaseLimitSet
+    *,
+    llm: str,
+    api_key: str,
+    limits: BaseLimitSet,
+    temperature: Optional[float] = None,
 ) -> SlowBurnLLM:
     """Create optimizer LLM using SlowBurnLLM.
 
@@ -344,6 +359,8 @@ def create_optimizer_llm(
         llm: LLM family key in LLM_CONFIGS.
         api_key: API key for LLM service.
         limits: Shared LimitSet for rate limiting.
+        temperature: Explicit temperature override from the algorithm class.
+            When ``None``, falls back to ``promptmoo_config.defaults.optimizer_llm_temperature``.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
@@ -357,6 +374,9 @@ def create_optimizer_llm(
     if reasoning and _detect_reasoning_family(model_name) is not None:
         max_tokens += REASONING_EXTRA_TOKENS
 
+    resolved_temperature = (
+        temperature if temperature is not None else cfg.optimizer_llm_temperature
+    )
     llm = SlowBurnLLM.options(
         mode="asyncio",
         limits=limits,
@@ -365,7 +385,7 @@ def create_optimizer_llm(
         name="optimizer_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=cfg.optimizer_llm_temperature,
+        temperature=resolved_temperature,
         max_tokens=max_tokens,
         timeout=cfg.optimizer_llm_timeout,
         litellm_params=_build_litellm_params(
@@ -379,13 +399,21 @@ def create_optimizer_llm(
 
 
 @validate
-def create_gradient_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurnLLM:
+def create_gradient_llm(
+    *,
+    llm: str,
+    api_key: str,
+    limits: BaseLimitSet,
+    temperature: Optional[float] = None,
+) -> SlowBurnLLM:
     """Create gradient LLM using SlowBurnLLM.
 
     Args:
         llm: LLM family key in LLM_CONFIGS.
         api_key: API key for LLM service.
         limits: Shared LimitSet for rate limiting.
+        temperature: Explicit temperature override from the algorithm class.
+            When ``None``, falls back to ``promptmoo_config.defaults.gradient_llm_temperature``.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
@@ -399,6 +427,9 @@ def create_gradient_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> Slow
     if reasoning and _detect_reasoning_family(model_name) is not None:
         max_tokens += REASONING_EXTRA_TOKENS
 
+    resolved_temperature = (
+        temperature if temperature is not None else cfg.gradient_llm_temperature
+    )
     llm = SlowBurnLLM.options(
         mode="asyncio",
         limits=limits,
@@ -407,7 +438,7 @@ def create_gradient_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> Slow
         name="gradient_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=cfg.gradient_llm_temperature,
+        temperature=resolved_temperature,
         max_tokens=max_tokens,
         timeout=cfg.gradient_llm_timeout,
         litellm_params=_build_litellm_params(
@@ -421,13 +452,21 @@ def create_gradient_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> Slow
 
 
 @validate
-def create_loss_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurnLLM:
+def create_loss_llm(
+    *,
+    llm: str,
+    api_key: str,
+    limits: BaseLimitSet,
+    temperature: Optional[float] = None,
+) -> SlowBurnLLM:
     """Create loss LLM using SlowBurnLLM.
 
     Args:
         llm: LLM family key in LLM_CONFIGS.
         api_key: API key for LLM service.
         limits: Shared LimitSet for rate limiting.
+        temperature: Explicit temperature override from the algorithm class.
+            When ``None``, falls back to ``promptmoo_config.defaults.loss_llm_temperature``.
     """
     if llm not in LLM_CONFIGS:
         raise ValueError(f"Unknown LLM: {llm}. Options: {list(LLM_CONFIGS.keys())}")
@@ -441,6 +480,9 @@ def create_loss_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurn
     if reasoning and _detect_reasoning_family(model_name) is not None:
         max_tokens += REASONING_EXTRA_TOKENS
 
+    resolved_temperature = (
+        temperature if temperature is not None else cfg.loss_llm_temperature
+    )
     llm = SlowBurnLLM.options(
         mode="asyncio",
         limits=limits,
@@ -449,7 +491,7 @@ def create_loss_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurn
         name="loss_llm",
         model_name=model_name,
         api_key=api_key,
-        temperature=cfg.loss_llm_temperature,
+        temperature=resolved_temperature,
         max_tokens=max_tokens,
         timeout=cfg.loss_llm_timeout,
         litellm_params=_build_litellm_params(
@@ -463,150 +505,184 @@ def create_loss_llm(*, llm: str, api_key: str, limits: BaseLimitSet) -> SlowBurn
 
 
 # Dataset configurations
-DATASET_CONFIGS = {
-    "SummEval": {
-        "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
-        "task_output_formats": {
-            "fluency": "An integer between 1 to 5",
-            "coherence": "An integer between 1 to 5",
-            "relevance": "An integer between 1 to 5",
-            "consistency": "An integer between 1 to 5",
-        },
-        "task_losses": {
-            "fluency": "accuracy",
-            "coherence": "accuracy",
-            "relevance": "accuracy",
-            "consistency": "accuracy",
-        },
-    },
-    "WildGuard": {
-        "prompt_prefix": "Evaluate the prompt and model response. Output JSON only. Do NOT include reasoning or explanations.",
-        "task_output_formats": {
-            "prompt_harm_label": '"unharmful" | "harmful"',
-            "response_harm_label": '"unharmful" | "harmful"',
-            "response_refusal_label": '"compliance" | "refusal"',
-        },
-        "task_losses": {
-            "prompt_harm_label": "accuracy",
-            "response_harm_label": "accuracy",
-            "response_refusal_label": "accuracy",
-        },
-    },
-    "BRIGHTER": {
-        "prompt_prefix": "Evaluate the emotion intensities in the text. Output JSON with intensity scores 0-3. Do NOT include reasoning or explanations. Each entry of anger, fear, joy, sadness, surprise should contain a single integer between 0 and 3. So entries like '0/3' or '0|3' or '0.5' are invalid.",
-        "task_output_formats": {
-            "anger": "An integer between 0 to 3",
-            "fear": "An integer between 0 to 3",
-            "joy": "An integer between 0 to 3",
-            "sadness": "An integer between 0 to 3",
-            "surprise": "An integer between 0 to 3",
-        },
-        "task_losses": {
-            "anger": "accuracy",
-            "fear": "accuracy",
-            "joy": "accuracy",
-            "sadness": "accuracy",
-            "surprise": "accuracy",
-        },
-    },
-}
 
 
 @validate
 def build_prompt_skeleton(
     *,
-    dataset_name: str,
+    dataset: Dataset,
     tasks: List[Task],
-    task_output_formats: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Build prompt skeleton dynamically based on selected tasks.
+    """Build prompt skeleton dynamically from the Dataset object.
+
+    The skeleton is the frozen portion of the task prompt that does NOT
+    change during optimization.  It contains:
+    1. The evaluation directive (what to evaluate)
+    2. General output constraints (no reasoning)
+
+    The per-task ``## Output format`` section is NOT part of the skeleton.
+    It lives in ``task_output_formats`` on ``PromptTemplate`` and is rendered
+    dynamically by ``render_instructions()``, which supports per-task
+    filtering via ``task_filter`` to prevent cross-task leakage in
+    TextGrad's ``separate_tasks`` mode.
+
+    The mutable per-task instructions are also NOT part of the skeleton;
+    they are appended by ``PromptTemplate.render_instructions()``.
 
     Args:
-        dataset_name: Name of the dataset
-        tasks: List of tasks to include in the prompt
-        task_output_formats: Optional dict mapping task names to output format specs.
-            If not provided, will use DATASET_CONFIGS.
+        dataset: Dataset instance.
+        tasks: List of tasks to include (order is preserved).
 
     Returns:
-        Complete prompt skeleton with dynamic JSON format section
+        Prompt skeleton string (without ``## Output format`` section).
     """
-    config = DATASET_CONFIGS[dataset_name]
-    prompt_prefix = config["prompt_prefix"]
+    from prompt_moo.task_output_spec import collective_output_noun
 
-    if task_output_formats is None:
-        task_output_formats = config["task_output_formats"]
+    task_output_specs: Dict[str, Any] = dataset.task_output_specs
+    evaluation_directive: str = dataset.evaluation_directive
 
-    task_names = [task.task_name for task in tasks]
-    if len(task_names) == 1:
-        task_list_str = f"Output ONLY the '{task_names[0]}' metric."
-    else:
-        task_list_str = f"Output the following metrics: {', '.join(task_names)}."
-
-    json_lines = []
-    for task in tasks:
-        task_name = task.task_name
-        if task_name not in task_output_formats:
+    if len(evaluation_directive) == 0:
+        if len(dataset.prompt_prefix) > 0:
+            evaluation_directive = dataset.prompt_prefix
+        else:
             raise ValueError(
-                f"Task '{task_name}' not found in output formats for dataset '{dataset_name}'"
+                f"Dataset {dataset.dataset_name!r} has empty evaluation_directive. "
+                f"Define it as a ClassVar on the Dataset subclass."
             )
-        output_format = task_output_formats[task_name]
-        json_lines.append(f'  "{task_name}": {output_format}')
 
-    json_format = "{\n" + ",\n".join(json_lines) + "\n}"
+    if len(task_output_specs) == 0:
+        task_output_formats: Dict[str, str] = dataset.task_output_formats
+        if len(task_output_formats) == 0:
+            raise ValueError(
+                f"Dataset {dataset.dataset_name!r} has empty task_output_specs "
+                f"and task_output_formats. Define task_output_specs."
+            )
+        for task in tasks:
+            if task.task_name not in task_output_formats:
+                raise ValueError(
+                    f"Task '{task.task_name}' not found in task_output_formats "
+                    f"for dataset '{dataset.dataset_name}'"
+                )
+        output_noun_plural: str = "values"
+    else:
+        for task in tasks:
+            if task.task_name not in task_output_specs:
+                raise ValueError(
+                    f"Task '{task.task_name}' not found in task_output_specs "
+                    f"for dataset '{dataset.dataset_name}'"
+                )
+        output_noun_plural = collective_output_noun(
+            {t.task_name: task_output_specs[t.task_name] for t in tasks}
+        )
 
-    skeleton = f"""{prompt_prefix}
-{task_list_str}
-Output format (follow this EXACTLY):
-{json_format}
-"""
+    skeleton: str = (
+        f"{evaluation_directive.strip()}"
+        f"\nUse the Instructions below to perform your evaluation. "
+        f"Output a JSON with the requested {output_noun_plural}. "
+        f"Do NOT include reasoning or explanations.\n"
+    )
 
     return skeleton
+
+
+def _build_task_output_formats(
+    *,
+    dataset: Dataset,
+    tasks: List[Task],
+) -> Dict[str, str]:
+    """Build per-task output format specs for ``PromptTemplate.task_output_formats``.
+
+    Reads from ``dataset.task_output_specs`` (preferred) or falls back to
+    ``dataset.task_output_formats`` (a plain string dict).
+
+    Args:
+        dataset: Dataset instance.
+        tasks: List of tasks to include (order is preserved).
+
+    Returns:
+        Dict mapping task_name to its format string (e.g. ``"1|2|3|4|5"``).
+    """
+    task_output_specs: Dict[str, Any] = dataset.task_output_specs
+    if len(task_output_specs) > 0:
+        result: Dict[str, str] = {}
+        for task in tasks:
+            if task.task_name not in task_output_specs:
+                raise ValueError(
+                    f"Task '{task.task_name}' not found in task_output_specs "
+                    f"for dataset '{dataset.dataset_name}'"
+                )
+            result[task.task_name] = task_output_specs[task.task_name].format_str
+        return result
+
+    task_output_formats: Dict[str, str] = dataset.task_output_formats
+    if len(task_output_formats) == 0:
+        raise ValueError(
+            f"Dataset {dataset.dataset_name!r} has empty task_output_specs "
+            f"and task_output_formats. Define task_output_specs."
+        )
+    result = {}
+    for task in tasks:
+        if task.task_name not in task_output_formats:
+            raise ValueError(
+                f"Task '{task.task_name}' not found in task_output_formats "
+                f"for dataset '{dataset.dataset_name}'"
+            )
+        result[task.task_name] = task_output_formats[task.task_name]
+    return result
 
 
 @validate
 def get_initial_prompt(
     *,
-    dataset_name: str,
+    dataset: Dataset,
     tasks: List[Task],
-    task_output_formats: Optional[Dict[str, str]] = None,
 ) -> PromptTemplate:
     """Get initial prompt for a dataset with specified tasks.
 
     Args:
-        dataset_name: Name of the dataset
-        tasks: List of tasks to include in the prompt
-        task_output_formats: Optional dict mapping task names to output format specs.
+        dataset: Dataset instance.
+        tasks: List of tasks to include in the prompt.
 
     Returns:
-        PromptTemplate configured for the specified tasks
+        PromptTemplate configured for the specified tasks, with
+        ``task_output_formats`` populated for per-task filtering support.
     """
-    skeleton = build_prompt_skeleton(
-        dataset_name=dataset_name,
+    skeleton: str = build_prompt_skeleton(
+        dataset=dataset,
         tasks=tasks,
-        task_output_formats=task_output_formats,
     )
-    return PromptTemplate.of(
-        "multi",
+    task_output_formats: Dict[str, str] = _build_task_output_formats(
+        dataset=dataset,
+        tasks=tasks,
+    )
+    return PromptTemplate(
         skeleton=skeleton,
         instruction={t.task_name: t.task_instruction for t in tasks},
         tasks=tasks,
+        input_col_labels=dataset.input_col_labels,
+        task_output_formats=task_output_formats,
     )
 
 
 @validate
 def get_task_losses(
-    *, dataset_name: str, tasks: Optional[List[Task]] = None
+    *, dataset: Dataset, tasks: Optional[List[Task]] = None
 ) -> Dict[str, str]:
-    """Get task losses for a dataset.
+    """Get task losses from the Dataset object.
 
     Args:
-        dataset_name: Name of the dataset
+        dataset: Dataset instance (carries task_losses).
         tasks: Optional list of tasks to filter losses for.
 
     Returns:
-        Dict mapping task names to loss function names
+        Dict mapping task names to loss function names.
     """
-    all_losses = DATASET_CONFIGS[dataset_name]["task_losses"]
+    all_losses = dataset.task_losses
+    if len(all_losses) == 0:
+        raise ValueError(
+            f"Dataset {dataset.dataset_name!r} has empty task_losses. "
+            f"Define it as a ClassVar on the Dataset subclass."
+        )
     if tasks is not None:
         task_names = {t.task_name for t in tasks}
         return {k: v for k, v in all_losses.items() if k in task_names}
@@ -617,32 +693,30 @@ def get_task_losses(
 def get_single_task_prompt(
     *,
     task: Task,
-    dataset_name: str,
-    task_output_formats: Optional[Dict[str, str]] = None,
+    dataset: Dataset,
 ) -> PromptTemplate:
     """Get initial prompt for a single task.
 
     Args:
-        task: The task to create a prompt for
-        dataset_name: Name of the dataset
-        task_output_formats: Optional dict mapping task names to output format specs.
+        task: The task to create a prompt for.
+        dataset: Dataset instance.
 
     Returns:
-        PromptTemplate configured for this single task
+        PromptTemplate configured for this single task.
     """
     skeleton = build_prompt_skeleton(
-        dataset_name=dataset_name,
+        dataset=dataset,
         tasks=[task],
-        task_output_formats=task_output_formats,
     )
-    return PromptTemplate.of(
-        "multi",
+    return PromptTemplate(
         skeleton=skeleton,
         instruction={task.task_name: task.task_instruction},
         tasks=[task],
+        input_col_labels=dataset.input_col_labels,
     )
 
 
+@validate
 def find_last_prompt(output_dir: str) -> Tuple[Optional[int], Optional[str]]:
     """Find the latest saved prompt in an output directory."""
     prompts_dir = os.path.join(output_dir, "prompts")
@@ -657,6 +731,7 @@ def find_last_prompt(output_dir: str) -> Tuple[Optional[int], Optional[str]]:
     return None, None
 
 
+@validate
 def check_run_status(output_dir: str) -> Dict[str, Any]:
     """Check the status of a run based on its output files."""
     summary_path = os.path.join(output_dir, "run_summary.json")
@@ -684,6 +759,7 @@ def check_run_status(output_dir: str) -> Dict[str, Any]:
     return result
 
 
+@validate
 def resume_failed_runs(
     futures: Dict[str, Any],
     experiments: List[Dict[str, Any]],
@@ -721,8 +797,6 @@ def resume_failed_runs(
                 steps=exp["steps"],
                 api_key=exp["api_key"],
                 batch_size=exp["batch_size"],
-                loss_batch_size=exp["loss_batch_size"],
-                gradient_batch_size=exp["gradient_batch_size"],
                 eval_every=exp["eval_every"],
                 verbosity=1,
                 start_step=resume_step,
@@ -738,42 +812,56 @@ class AlgorithmRunner(Worker):
 
     Each AlgorithmRunner instance creates a shared LimitSet that is used by all
     LLM workers it instantiates, ensuring proper rate limiting across all LLM calls.
+
+    Algorithm-specific parameters (e.g. ``k``, ``validation_metric``,
+    ``trajectory_strategy``) are passed through via
+    ``**algo_params`` and forwarded directly to the algorithm constructor.
+    The runner does not hard-code any algorithm hyperparameters.
     """
 
+    # @validate omitted: Worker methods are serialized for Ray remote execution.
+    # validate_call closure is not picklable across process boundaries.
     def run(
         self,
         *,
         dataset: Dataset,
         algo_name: str,
         api_key: str,
-        steps: int,
-        batch_size: int,
-        loss_batch_size: int,
-        gradient_batch_size: int,
-        eval_every: int,
+        steps: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        eval_every: Optional[int] = None,
         run_name: str = "run1",
-        llm: str = "llama3.1",
+        llm: str = "qwen3",
         verbosity: int = 1,
         start_step: int = 0,
         resume_prompt: Optional[str] = None,
-        **kwargs,
+        output_dir: Optional[str] = None,
+        **algo_params,
     ) -> Dict[str, Any]:
         """Run algorithm and return results.
 
         Args:
-            dataset: Dataset to run on
-            algo_name: Algorithm name ("gpo", "opro", "textgrad")
-            api_key: API key for LLM service
-            steps: Number of training steps
-            batch_size: Batch size for training
-            loss_batch_size: Batch size for loss computation
-            gradient_batch_size: Batch size for gradient computation
-            eval_every: Evaluate every N steps
-            run_name: Name for this run
-            llm: LLM family to use
-            verbosity: Logging verbosity (0=silent, 1=default, 2=detailed, 3=debug)
-            start_step: Resume from this step
-            resume_prompt: Resume from this prompt
+            dataset: Dataset to run on.
+            algo_name: Algorithm name ("gpo", "opro", "textgrad").
+            api_key: API key for LLM service.
+            steps: Number of training steps.
+            batch_size: Batch size for training.
+            eval_every: Evaluate every N steps.
+            run_name: Name for this run.
+            llm: LLM family to use.
+            verbosity: Logging verbosity (0=silent, 1=default, 2=detailed, 3=debug).
+            start_step: Resume from this step.
+            resume_prompt: Resume from this prompt content.
+            output_dir: Output directory (auto-generated if None).
+            **algo_params: Algorithm-specific hyperparameters passed directly
+                to the algorithm constructor.  Examples:
+                - GPO: ``k=5``, ``trajectory_strategy="relevance"``
+                - OPRO: ``k=20``, ``num_candidates=8``
+                - TextGrad: ``validation_metric="accuracy"``,
+                  ``validation_gate_samples=50``
+                Any parameter accepted by the algorithm's constructor can
+                be passed here.  Unknown keys will be rejected by Pydantic
+                validation at construction time.
         """
         print(
             f"[AlgorithmRunner] Starting {algo_name} on {dataset.dataset_name} "
@@ -783,76 +871,124 @@ class AlgorithmRunner(Worker):
         try:
             tasks = dataset.tasks
 
-            task_output_formats = (
-                dataset.task_output_formats
-                if len(dataset.task_output_formats) > 0
-                else None
-            )
             initial_prompt = get_initial_prompt(
-                dataset_name=dataset.dataset_name,
+                dataset=dataset,
                 tasks=tasks,
-                task_output_formats=task_output_formats,
             )
-            task_losses = get_task_losses(
-                dataset_name=dataset.dataset_name, tasks=tasks
-            )
+            task_losses = get_task_losses(dataset=dataset, tasks=tasks)
 
             shared_limits = create_shared_limits()
 
-            task_llm = create_task_llm(llm=llm, api_key=api_key, limits=shared_limits)
+            # Resolve the algorithm class so we can read its temperature defaults
+            # BEFORE creating LLM workers.  If the caller passed explicit
+            # temperature overrides in algo_params, those take priority over
+            # the class-level defaults.
+            algo_cls_map = {
+                "gpo": GPO,
+                "opro": OPRO,
+                "textgrad": TextGrad,
+            }
+            if algo_name not in algo_cls_map:
+                raise ValueError(
+                    f"Unknown algorithm: {algo_name!r}. "
+                    f"Must be 'gpo', 'textgrad', or 'opro'."
+                )
+            algo_cls = algo_cls_map[algo_name]
+
+            def _resolve_temperature(
+                field_name: str,
+            ) -> Optional[float]:
+                """Read temperature from algo_params (explicit override) or class default."""
+                if field_name in algo_params:
+                    return algo_params[field_name]
+                field_info = algo_cls.model_fields.get(field_name)
+                if field_info is not None:
+                    return field_info.default
+                return None
+
+            task_llm = create_task_llm(
+                llm=llm,
+                api_key=api_key,
+                limits=shared_limits,
+                temperature=_resolve_temperature("task_llm_temperature"),
+            )
             optimizer_llm = create_optimizer_llm(
-                llm=llm, api_key=api_key, limits=shared_limits
+                llm=llm,
+                api_key=api_key,
+                limits=shared_limits,
+                temperature=_resolve_temperature("optimizer_llm_temperature"),
             )
             gradient_llm = create_gradient_llm(
-                llm=llm, api_key=api_key, limits=shared_limits
+                llm=llm,
+                api_key=api_key,
+                limits=shared_limits,
+                temperature=_resolve_temperature("gradient_llm_temperature"),
             )
-            loss_llm = create_loss_llm(llm=llm, api_key=api_key, limits=shared_limits)
+            loss_llm = create_loss_llm(
+                llm=llm,
+                api_key=api_key,
+                limits=shared_limits,
+                temperature=_resolve_temperature("loss_llm_temperature"),
+            )
 
-            common_params = {
+            common_params: Dict[str, Any] = {
                 "tasks": tasks,
-                "steps": steps,
-                "batch_size": batch_size,
-                "loss_batch_size": loss_batch_size,
-                "gradient_batch_size": gradient_batch_size,
-                "eval_every": eval_every,
                 "name": f"{dataset.dataset_name}_{algo_name}_{run_name}",
                 "verbosity": verbosity,
             }
+            if steps is not None:
+                common_params["steps"] = steps
+            if batch_size is not None:
+                common_params["batch_size"] = batch_size
+            if eval_every is not None:
+                common_params["eval_every"] = eval_every
 
             if algo_name == "gpo":
-                algo = GPO(
+                algo = algo_cls(
                     task_llm=task_llm,
-                    gradient_llm=gradient_llm,
                     optimizer_llm=optimizer_llm,
-                    loss_llm=loss_llm,
                     task_losses=task_losses,
-                    k=5,
-                    warmup_steps=5,
-                    **common_params,
+                    **{
+                        **common_params,
+                        **algo_params,
+                    },
                 )
             elif algo_name == "textgrad":
-                algo = TextGrad(
+                textgrad_defaults: Dict[str, Any] = {
+                    "validation_metric": "none",
+                }
+                textgrad_defaults.update(algo_params)
+                algo = algo_cls(
                     task_llm=task_llm,
                     gradient_llm=gradient_llm,
                     optimizer_llm=optimizer_llm,
                     loss_llm=loss_llm,
-                    **common_params,
+                    task_losses=task_losses,
+                    **{
+                        **common_params,
+                        **textgrad_defaults,
+                    },
                 )
             elif algo_name == "opro":
-                algo = OPRO(
+                algo = algo_cls(
                     task_llm=task_llm,
                     optimizer_llm=optimizer_llm,
                     task_losses=task_losses,
-                    k=5,
-                    **common_params,
+                    **{
+                        **common_params,
+                        **algo_params,
+                    },
                 )
             else:
-                raise ValueError(f"Unknown algorithm: {algo_name}")
+                raise ValueError(
+                    f"Unknown algorithm: {algo_name!r}. "
+                    f"Must be 'gpo', 'textgrad', or 'opro'."
+                )
 
             results = algo.train(
                 dataset=dataset,
                 initial_prompt=initial_prompt,
-                output_dir=kwargs.get("output_dir"),
+                output_dir=output_dir,
                 start_step=start_step,
             )
 
@@ -866,11 +1002,12 @@ class AlgorithmRunner(Worker):
                 "llm": llm,
                 "steps": steps,
                 "batch_size": batch_size,
-                "loss_batch_size": loss_batch_size,
-                "gradient_batch_size": gradient_batch_size,
                 "eval_every": eval_every,
                 "results": results,
-                **kwargs,
+                **{
+                    **common_params,
+                    **algo_params,
+                },
             }
         except Exception as e:
             print(
@@ -886,9 +1023,10 @@ class AlgorithmRunner(Worker):
                 "llm": llm,
                 "steps": steps,
                 "batch_size": batch_size,
-                "loss_batch_size": loss_batch_size,
-                "gradient_batch_size": gradient_batch_size,
                 "eval_every": eval_every,
-                "error": str(e),
-                **kwargs,
+                "error": format_exception_msg(e),
+                **{
+                    **common_params,
+                    **algo_params,
+                },
             }

@@ -5,23 +5,29 @@ This is Step 1 of the optimization pipeline.
 """
 
 import json
+import re
 from abc import ABC, abstractmethod
-from typing import Any, List
+from typing import Any, Dict, List, Optional, Union
 
-from morphic import Registry, Typed
+from morphic import Registry, Typed, validate
 from morphic.typed import format_exception_msg
 
 from .config import promptmoo_config
 from .data_structures import Batch, PredictionResult
 from .llm_utils import apply_prompt_suffix
-from .prompt_template_utils import PromptTemplate
+from .prompt_template import PromptTemplate
+from .types import strip_smart_quotes
 
 # Export validator for use when creating LLM pools
 __all__ = ["TaskPredictor", "StandardTaskPredictor", "validate_task_response"]
 
 
+@validate
 def parse_task_response(response: str, **context) -> dict:
     """Parse JSON from LLM response.
+
+    Handles clean JSON, preamble/postamble text, code fences, and
+    escaped ``{{``/``}}`` braces from f-string template echo.
 
     Args:
         response: Raw LLM response text
@@ -43,27 +49,34 @@ def parse_task_response(response: str, **context) -> dict:
     if not isinstance(response, str):
         response = str(response)
 
-    # Extract JSON block from response
-    response = response.strip().replace("{{", "{").replace("}}", "}")
-    start = response.find("{")
-    end = response.rfind("}") + 1
+    text: str = response.strip()
+
+    fence_match: Optional[re.Match] = re.search(
+        r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL
+    )
+    if fence_match is not None:
+        inner: str = fence_match.group(1).strip()
+        if len(inner) > 0 and "{" in inner:
+            text = inner
+
+    start: int = text.find("{")
+    end: int = text.rfind("}") + 1
 
     if start == -1 or end == 0:
         raise ValueError(f"No JSON found in response:\n{response}")
 
-    json_str = (
-        response[start:end]
-        .removeprefix('"')
-        .removesuffix('"')
-        .removeprefix('"')
-        .removesuffix('"')
-        .removeprefix('"')
-        .removesuffix('"')
-    )
+    json_str: str = strip_smart_quotes(text[start:end])
 
     try:
         return json.loads(json_str)
-    except Exception as e:
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: try replacing escaped braces from template echo
+    fallback: str = json_str.replace("{{", "{").replace("}}", "}")
+    try:
+        return json.loads(fallback)
+    except (json.JSONDecodeError, ValueError) as e:
         raise ValueError(
             f"Failed to parse JSON: {format_exception_msg(e)}.\nResponse:\n{response}"
         )
@@ -83,15 +96,42 @@ def validate_task_response(result: str, **context) -> bool:
         return False
 
     try:
-        start = result.find("{")
-        end = result.rfind("}") + 1
-        if start == -1 or end == 0:
-            return False
-        json_str = result[start:end].replace("{{", "{").replace("}}", "}")
-        json.loads(json_str)
+        parse_task_response(result)
         return True
-    except (json.JSONDecodeError, ValueError):
+    except (ValueError, json.JSONDecodeError):
         return False
+
+
+def _extract_numeric_outputs(parsed: dict) -> dict:
+    """Extract numeric task scores from a parsed JSON dict.
+
+    Handles:
+    - int/float values (normal case): kept as-is
+    - String integers ("5"): coerced to int
+    - String floats ("4.5"): coerced to float
+    - Booleans: excluded (bool is subclass of int in Python)
+    - Strings, nulls, dicts: excluded
+    """
+    result: Dict[str, Union[int, float]] = {}
+    for k, v in parsed.items():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            result[k] = v
+            continue
+        if isinstance(v, str):
+            v_stripped: str = v.strip()
+            try:
+                result[k] = int(v_stripped)
+                continue
+            except ValueError:
+                pass
+            try:
+                result[k] = float(v_stripped)
+                continue
+            except ValueError:
+                pass
+    return result
 
 
 class TaskPredictor(Typed, Registry, ABC):
@@ -107,7 +147,7 @@ class TaskPredictor(Typed, Registry, ABC):
         self,
         batch: Batch,
         prompt_template: PromptTemplate,
-        llm_pool: Any,
+        llm_pool: Any,  # LLMPool protocol; see types.py
         verbosity: int = 1,
         **kwargs,
     ) -> List[PredictionResult]:
@@ -131,11 +171,12 @@ class StandardTaskPredictor(TaskPredictor):
 
     aliases = ["standard", "default"]
 
+    @validate
     def predict(
         self,
         batch: Batch,
         prompt_template: PromptTemplate,
-        llm_pool: Any,
+        llm_pool: Any,  # LLMPool protocol; see types.py
         verbosity: int = 1,
         failure_tolerance: float = 0.05,
         **kwargs,
@@ -144,54 +185,55 @@ class StandardTaskPredictor(TaskPredictor):
 
         Args:
             batch: Batch of dataset samples
-            prompt_template: Current prompt template
+            prompt_template: Current prompt template (carries ``input_col_labels``
+                for sample rendering)
             llm_pool: LLM worker pool
             verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Unused, for compatibility
 
         Returns:
             List of PredictionResult objects
         """
-        # Build prompts for each sample
-        prompts = []
+        prompts: List[str] = []
         for sample in batch.samples:
-            prompt = prompt_template.to_str() + "\n\n"
-            prompt += "## Sample Point\n"
-            for col, val in sample.inputs.items():
-                prompt += f"{col}: {val}\n"
-            prompts.append(prompt)
+            prompts.append(prompt_template.render_task_prompt(sample=sample))
 
         prompts = apply_prompt_suffix(prompts, llm_pool)
-        cfg = promptmoo_config.defaults
         responses = llm_pool.call_llm_batch(
             prompts=prompts,
             verbosity=verbosity,
-        ).result(timeout=cfg.batch_invocation_timeout)
+        ).result(timeout=promptmoo_config.defaults.batch_invocation_timeout)
 
         # Parse responses into PredictionResult
-        results = []
-        num_failed_parsing = 0
+        results: List[PredictionResult] = []
+        num_failed_parsing: int = 0
         for sample, prompt, response in zip(batch.samples, prompts, responses):
             try:
-                outputs = parse_task_response(response)
+                outputs: dict = parse_task_response(response)
             except ValueError as e:
                 num_failed_parsing += 1
+                error_message: str = format_exception_msg(e)
                 if verbosity >= 1:
                     print(
-                        f"Failed to parse task response for sample {sample.sample_id}:\n{format_exception_msg(e)}"
+                        f"Failed to parse task response for sample {sample.sample_id}:\n{error_message}"
                     )
+                results.append(
+                    PredictionResult(
+                        sample_id=sample.sample_id,
+                        prompt=prompt,
+                        task_outputs={},
+                        raw_response=response
+                        if isinstance(response, str)
+                        else str(response),
+                        parser_error=error_message,
+                    )
+                )
                 continue
             results.append(
                 PredictionResult(
                     sample_id=sample.sample_id,
-                    # task_outputs=outputs.get("scores", {})
-                    # if isinstance(outputs, dict)
-                    # else {},
-                    task_outputs={
-                        k: v for k, v in outputs.items() if isinstance(v, (int, float))
-                    },
+                    prompt=prompt,
+                    task_outputs=_extract_numeric_outputs(outputs),
                     raw_response=response,
-                    prompt=prompt,  # Store the LLM input for observability
                 )
             )
         if num_failed_parsing >= len(batch.samples) * failure_tolerance:

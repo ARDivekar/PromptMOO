@@ -1,84 +1,121 @@
 """
-Observability Manager: Comprehensive logging for prompt optimization runs.
+Observability Manager: A domain-agnostic ledger for prompt optimization runs.
 
-This module handles all logging, file storage, and output generation for research analysis.
+The ObservabilityManager is a **dumb storage layer**. It knows nothing about
+algorithms, trajectories, prompts, or tasks. It provides three primitives:
 
-File layout per run:
+1. ``record(key, value)`` — Add a key-value pair to the current step page.
+   If the value is a Pydantic BaseModel (or Morphic Typed), ``model_dump()``
+   is called automatically.  Lists of BaseModels are model_dumped elementwise.
+   Everything else is stored as-is.
+
+2. ``log_step_end(step)`` — Flush the current page to a Parquet file and
+   start a new blank page.
+
+3. ``write_file(relative_path, content)`` — Write arbitrary text to a file
+   under the output directory.
+
+The algorithm classes are responsible for serializing their own domain objects
+before calling ``record()``.
+
+Step numbering convention:
+    Step 0: Baseline evaluation only (no optimization, no run_logs entry).
+    Steps 1..N: Optimization steps (each gets a run_logs entry).
+
+File layout per run::
+
     output_dir/
         run_summary.json          — config + finalized step summary
         steps_summary.jsonl       — append-only step index (crash-safe)
-        prompts/
-            step_0_old.txt
-            step_0_new.txt
-            step_0_meta_prompt.txt
-            step_0_optimizer_response.txt
+        run_logs/                  — one parquet per optimization step
+            step_0001.parquet     — Step 1 (first optimization)
+            step_0002.parquet
             ...
-        run_logs/                  — one parquet per step (O(1) per step, no re-reads)
-            step_0000.parquet
-            step_0001.parquet
-            ...
-        eval_step_0.parquet        — evaluation results (unchanged)
-        eval_step_5.parquet
+        eval_step_0.parquet       — baseline (initial prompt, before optimization)
+        eval_step_1.parquet       — after Step 1
+        eval_step_5.parquet       — after Step 5 (if eval_every=5)
         ...
 """
 
 import glob
 import json
 import os
+import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+from morphic import Typed, validate
 from morphic.typed import format_exception_msg
-
-from .data_structures import (
-    Batch,
-    NumericFeedback,
-    PredictionResult,
-    Task,
-    TextGradient,
-    TextualFeedback,
-)
-from .prompt_template_utils import PromptTemplate
-from .prompt_trajectory import PromptTrajectory
+from pydantic import BaseModel, PrivateAttr
 
 
-class ObservabilityManager:
-    """Manages all logging and output for optimization runs.
+def _serialize_value(value: Any) -> Any:
+    """Serialize a single value for JSON/Parquet storage.
+
+    - Pydantic BaseModel / Morphic Typed → ``.model_dump()``
+    - List of BaseModels → ``[item.model_dump() for item in value]``
+    - Everything else → as-is
+    """
+    if isinstance(value, (Typed, BaseModel)):
+        return value.model_dump()
+    elif isinstance(value, (list, tuple, set)):
+        return [_serialize_value(item) for item in value]
+    elif isinstance(value, dict):
+        return {_serialize_value(k): _serialize_value(v) for k, v in value.items()}
+    return value
+
+
+class ObservabilityManager(Typed):
+    """Domain-agnostic ledger for optimization run logging.
 
     Each training step is written to its own parquet file under ``run_logs/``.
-    This avoids the O(N^2) read-concat-rewrite pattern entirely: writing step N
-    is always O(1) regardless of how many steps came before.
+    This avoids the O(N^2) read-concat-rewrite pattern: writing step N is
+    always O(1) regardless of how many steps came before.
 
     To read all steps at once (e.g. after training), call
-    ``ObservabilityManager.read_run_logs(output_dir)`` which concatenates the
-    per-step parquets into a single DataFrame.
+    ``ObservabilityManager.read_run_logs(output_dir)`` which concatenates
+    the per-step parquets into a single DataFrame.
+
+    Attributes:
+        output_dir: Root directory for all run outputs.
+        run_logs_dir: Directory containing per-step parquet files.
+        summary_path: Path to the run_summary.json file.
+        steps_jsonl_path: Path to the append-only steps index.
     """
 
     output_dir: str
     run_logs_dir: str
     summary_path: str
     steps_jsonl_path: str
-    prompts_dir: str
-    current_step_data: Dict[str, Any]
+    verbosity: int = 1
 
-    def __init__(self, output_dir: str) -> None:
-        """Initialize observability manager.
+    _current_step_data: Dict[str, Any] = PrivateAttr(default_factory=dict)
+    _total_steps_logged: int = PrivateAttr(default=0)
 
-        Args:
-            output_dir: Directory to store all outputs.
-        """
-        self.output_dir = output_dir
-        self.run_logs_dir = os.path.join(output_dir, "run_logs")
-        self.summary_path = os.path.join(output_dir, "run_summary.json")
-        self.steps_jsonl_path = os.path.join(output_dir, "steps_summary.jsonl")
-        self.prompts_dir = os.path.join(output_dir, "prompts")
+    @classmethod
+    def pre_initialize(cls, data: dict) -> None:
+        output_dir = data["output_dir"]
+        data.setdefault("run_logs_dir", os.path.join(output_dir, "run_logs"))
+        data.setdefault("summary_path", os.path.join(output_dir, "run_summary.json"))
+        data.setdefault(
+            "steps_jsonl_path", os.path.join(output_dir, "steps_summary.jsonl")
+        )
 
-        os.makedirs(self.prompts_dir, exist_ok=True)
+    def post_initialize(self) -> None:
+        os.makedirs(os.path.join(self.output_dir, "prompts"), exist_ok=True)
         os.makedirs(self.run_logs_dir, exist_ok=True)
 
-        self.current_step_data = {}
-        self._total_steps_logged = 0
+    # ------------------------------------------------------------------
+    # Backward-compatible property so tests using .current_step_data work
+    # ------------------------------------------------------------------
+    @property
+    def current_step_data(self) -> Dict[str, Any]:
+        return self._current_step_data
+
+    @current_step_data.setter
+    def current_step_data(self, value: Dict[str, Any]) -> None:
+        self._current_step_data = value
 
     # ------------------------------------------------------------------
     # Static helper: read all per-step parquets into one DataFrame
@@ -86,10 +123,6 @@ class ObservabilityManager:
     @staticmethod
     def read_run_logs(output_dir: str) -> pd.DataFrame:
         """Read all per-step parquet files and concatenate into one DataFrame.
-
-        Uses ``glob.glob`` to find all ``step_*.parquet`` files under
-        ``run_logs/``, sorts them by step number, and concatenates.
-        Each row is guaranteed to have a ``step`` column.
 
         Falls back to reading a legacy single-file ``run_logs.parquet``
         if the ``run_logs/`` directory does not exist (for old runs).
@@ -131,7 +164,7 @@ class ObservabilityManager:
         for step_num, fpath in sorted_files:
             try:
                 part = pd.read_parquet(fpath, engine="pyarrow")
-            except Exception as e:
+            except (IOError, OSError) as e:
                 raise IOError(
                     f"Failed to read step parquet at {fpath!r}:\n"
                     f"{format_exception_msg(e)}"
@@ -146,10 +179,11 @@ class ObservabilityManager:
         return combined
 
     # ------------------------------------------------------------------
-    # Logging methods
+    # Primitive: config logging
     # ------------------------------------------------------------------
+    @validate
     def log_config(self, config: Dict[str, Any]) -> None:
-        """Log run configuration.
+        """Log run configuration to run_summary.json.
 
         Args:
             config: Configuration dictionary with all hyperparameters.
@@ -160,8 +194,10 @@ class ObservabilityManager:
             try:
                 with open(self.steps_jsonl_path, "r") as f:
                     self._total_steps_logged = sum(1 for line in f if line.strip())
-            except Exception:
-                pass
+            except (IOError, OSError, json.JSONDecodeError) as e:
+                raise IOError(
+                    f"Could not read steps_summary.jsonl:\n{format_exception_msg(e)}"
+                ) from e
 
         with open(self.summary_path, "w") as f:
             json.dump(
@@ -172,287 +208,112 @@ class ObservabilityManager:
                 },
                 f,
                 indent=2,
+                default=str,
             )
 
+    # ------------------------------------------------------------------
+    # Primitive: step lifecycle
+    # ------------------------------------------------------------------
+    @validate
     def log_step_start(self, step: int) -> None:
-        """Log the start of a step.
+        """Start a new ledger page for the given step.
 
         Args:
             step: Step number.
         """
-        self.current_step_data = {"step": step, "timestamp": datetime.now().isoformat()}
-
-    def log_batch(self, batch: Batch) -> None:
-        """Log the batch samples.
-
-        Args:
-            batch: Batch of dataset samples.
-        """
-        self.current_step_data["batch"] = {
-            "step": batch.step,
-            "num_samples": len(batch.samples),
-            "samples": [s.model_dump() for s in batch.samples],
-        }
-
-    def log_predictions(self, predictions: List[PredictionResult]) -> None:
-        """Log prediction results.
-
-        Args:
-            predictions: List of prediction results.
-        """
-        self.current_step_data["predictions"] = {
-            "num_predictions": len(predictions),
-            "predictions": [p.model_dump() for p in predictions],
-        }
-
-    def log_feedbacks(
-        self,
-        feedbacks: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]],
-    ) -> None:
-        """Log feedback/loss computations.
-
-        Args:
-            feedbacks: Dict of feedbacks from loss computer (keys are Task objects).
-        """
-        serialized_feedbacks: Dict[str, List[Dict[str, Any]]] = {}
-        for task, feedback_list in feedbacks.items():
-            serialized_feedbacks[task.task_name] = [
-                fb.model_dump() for fb in feedback_list
-            ]
-
-        self.current_step_data["feedbacks"] = {
-            "num_tasks": len(feedbacks),
-            "feedbacks": serialized_feedbacks,
-        }
-
-    def log_gradients(
-        self,
-        gradients: Dict[Task, List[TextGradient]],
-    ) -> None:
-        """Log gradient computations including LLM prompts and responses.
-
-        Args:
-            gradients: Dict of gradients from gradient computer (keys are Task objects).
-        """
-        serialized_gradients: Dict[str, List[Dict[str, Any]]] = {}
-        for task, gradient_list in gradients.items():
-            serialized_gradients[task.task_name] = [
-                g.model_dump() for g in gradient_list
-            ]
-
-        self.current_step_data["gradients"] = {
-            "num_tasks": len(gradients),
-            "gradients": serialized_gradients,
-        }
-
-    def log_algorithm_context(self, context: Dict[str, Any]) -> None:
-        """Log algorithm-specific context passed to components.
-
-        Args:
-            context: Algorithm context dict (e.g., loss_functions, trajectory, etc.).
-        """
-        serialized_context: Dict[str, Any] = {}
-        for key, value in context.items():
-            if key == "trajectory" and value is not None:
-                trajectory: PromptTrajectory = value
-                try:
-                    serialized_context["trajectory"] = [
-                        {
-                            "loss_fns": elem.loss_fns,
-                            "scores": elem.scores,
-                            "grads": elem.grads,
-                            "instructions": elem.instructions,
-                            "ranking_metric": elem.ranking_metric(),
-                        }
-                        for elem in trajectory.get_topk()
-                    ]
-                    serialized_context["trajectory_k"] = trajectory.k
-                except Exception:
-                    serialized_context["trajectory"] = str(value)
-            elif key == "batch":
-                continue
-            else:
-                serialized_context[key] = value
-
-        self.current_step_data["algorithm_context"] = serialized_context
-
-    def log_algorithm_state(self, state: Dict[str, Any]) -> None:
-        """Log algorithm-specific state after updates.
-
-        Args:
-            state: Algorithm state dict (e.g., trajectory, previous_instructions, etc.).
-        """
-        serialized_state: Dict[str, Any] = {}
-        for key, value in state.items():
-            if key == "trajectory" and value is not None:
-                trajectory: PromptTrajectory = value
-                try:
-                    serialized_state["trajectory"] = [
-                        {
-                            "loss_fns": elem.loss_fns,
-                            "scores": elem.scores,
-                            "grads": elem.grads,
-                            "instructions": elem.instructions,
-                            "ranking_metric": elem.ranking_metric(),
-                        }
-                        for elem in trajectory.get_topk()
-                    ]
-                    serialized_state["trajectory_k"] = trajectory.k
-                    serialized_state["trajectory_size"] = len(trajectory)
-                except Exception:
-                    serialized_state["trajectory"] = str(value)
-            else:
-                serialized_state[key] = value
-
-        self.current_step_data["algorithm_state"] = serialized_state
-
-    def log_prompt_update(
-        self,
-        old_prompt: PromptTemplate,
-        new_prompt: PromptTemplate,
-        meta_prompt: Optional[str] = None,
-        optimizer_response: Optional[str] = None,
-    ) -> None:
-        """Log prompt update with full text storage including optimizer LLM calls.
-
-        Args:
-            old_prompt: Previous prompt template.
-            new_prompt: New prompt template.
-            meta_prompt: The meta-prompt sent to optimizer LLM.
-            optimizer_response: The raw response from optimizer LLM.
-        """
-        step = self.current_step_data["step"]
-
-        old_prompt_path = os.path.join(self.prompts_dir, f"step_{step}_old.txt")
-        new_prompt_path = os.path.join(self.prompts_dir, f"step_{step}_new.txt")
-
-        with open(old_prompt_path, "w") as f:
-            f.write(old_prompt.to_str())
-        with open(new_prompt_path, "w") as f:
-            f.write(new_prompt.to_str())
-
-        if meta_prompt is not None:
-            meta_prompt_path = os.path.join(
-                self.prompts_dir, f"step_{step}_meta_prompt.txt"
-            )
-            with open(meta_prompt_path, "w") as f:
-                f.write(meta_prompt)
-
-        if optimizer_response is not None:
-            optimizer_response_path = os.path.join(
-                self.prompts_dir, f"step_{step}_optimizer_response.txt"
-            )
-            with open(optimizer_response_path, "w") as f:
-                f.write(optimizer_response)
-
-        self.current_step_data["prompt_update"] = {
-            "old_prompt_file": f"prompts/step_{step}_old.txt",
-            "new_prompt_file": f"prompts/step_{step}_new.txt",
-            "old_instruction": old_prompt.instruction,
-            "new_instruction": new_prompt.instruction,
-            "instructions_changed": new_prompt.instruction,
-            "meta_prompt": meta_prompt,
-            "optimizer_response": optimizer_response,
-            "meta_prompt_file": f"prompts/step_{step}_meta_prompt.txt"
-            if meta_prompt is not None
-            else None,
-            "optimizer_response_file": f"prompts/step_{step}_optimizer_response.txt"
-            if optimizer_response is not None
-            else None,
-        }
-
-    def log_evaluation(self, step: int, results: Dict[str, Any]) -> None:
-        """Log evaluation results.
-
-        Args:
-            step: Step number.
-            results: Evaluation results dictionary.
-        """
-        prompt: str = results.get("task_prompt", "")
-        preds: List[PredictionResult] = results.get("prompt_predictions", [])
-        inputs: List[Any] = results.get("dataset_inputs", [])
-
-        pred_map = {p.sample_id: p for p in preds}
-        input_map = {s.sample_id: s for s in inputs}
-
-        flattened = []
-        for sid, sample in input_map.items():
-            pred_obj = pred_map.get(sid)
-            pred_outputs = pred_obj.task_outputs if pred_obj else {}
-
-            ground_truths = sample.ground_truths
-            ground_truth_flat = {f"gt_{k}": v for k, v in ground_truths.items()}
-            pred_flat = {f"pred_{k}": v for k, v in pred_outputs.items()}
-
-            raw_response = pred_obj.raw_response if pred_obj else None
-
-            row = {
-                "step": step,
-                "sample_id": sid,
-                "task_prompt": prompt,
-                "inputs": sample.inputs,
-                "prediction_score": raw_response,
-            }
-            row.update(ground_truth_flat)
-            row.update(pred_flat)
-            flattened.append(row)
-
-        df = pd.DataFrame(flattened)
-        output_path = os.path.join(self.output_dir, f"eval_step_{step}.parquet")
-        df.to_parquet(output_path, engine="pyarrow")
-        print(f"[Observer] Saved evaluation results → {output_path}")
-        self.current_step_data["evaluation"] = {
+        self._current_step_data = {
             "step": step,
-            "results_file": output_path,
+            "timestamp": datetime.now().isoformat(),
         }
 
-    # ------------------------------------------------------------------
-    # Step finalization
-    # ------------------------------------------------------------------
-    def _serialize_step(self, step_data: Dict) -> Dict:
-        serialized = {}
-        for k, v in step_data.items():
-            if isinstance(v, (dict, list)):
-                serialized[k] = json.dumps(v, ensure_ascii=False)
-            else:
-                serialized[k] = v
-        return serialized
+    @validate
+    def record(self, *, key: str, value: Any) -> None:
+        """Add a key-value pair to the current step page.
 
+        If ``value`` is a Pydantic BaseModel (or Morphic Typed),
+        ``model_dump()`` is called.  If it is a list of BaseModels,
+        each element is model_dumped.  Otherwise stored as-is.
+
+        Args:
+            key: Column name in the step's parquet row.
+            value: The data to store. Must be JSON-serializable
+                   (after automatic model_dump conversion).
+        """
+        self._current_step_data[key] = _serialize_value(value)
+
+    @validate
+    def write_file(self, *, relative_path: str, content: str) -> None:
+        """Write arbitrary text to a file under the output directory.
+
+        Creates parent directories as needed.
+
+        Args:
+            relative_path: Path relative to ``output_dir``.
+            content: Text content to write.
+        """
+        full_path = os.path.join(self.output_dir, relative_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(content)
+
+    @validate
+    def write_parquet(self, *, relative_path: str, dataframe: pd.DataFrame) -> str:
+        """Write a DataFrame to a parquet file under the output directory.
+
+        Args:
+            relative_path: Path relative to ``output_dir``.
+            dataframe: The DataFrame to write.
+
+        Returns:
+            Absolute path to the written file.
+        """
+        full_path = os.path.join(self.output_dir, relative_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        dataframe.to_parquet(full_path, engine="pyarrow")
+        if self.verbosity >= 1:
+            print(f"[Observer] Saved → {full_path}")
+        return full_path
+
+    @validate
     def log_step_end(self, step: int) -> None:
-        """Finalize and write step data to its own parquet file.
+        """Flush the current step page to a Parquet file.
 
-        Each step is written as ``run_logs/step_NNNN.parquet``.  No previous
-        files are read — this is O(1) per step.
+        Each step is written as ``run_logs/step_NNNN.parquet``.
+        No previous files are read — O(1) per step.
 
         Args:
             step: Step number.
         """
         self._total_steps_logged += 1
 
-        serialized_row = self._serialize_step(self.current_step_data)
+        serialized_row = self._serialize_step(self._current_step_data)
         step_df = pd.DataFrame([serialized_row])
         step_parquet_path = os.path.join(self.run_logs_dir, f"step_{step:04d}.parquet")
         step_df.to_parquet(step_parquet_path, engine="pyarrow")
-        print(f"[Observer] Wrote step {step} → {step_parquet_path}")
+        if self.verbosity >= 2:
+            print(f"[Observer] Wrote step {step} → {step_parquet_path}")
 
         step_entry = {
-            "step": self.current_step_data.get("step"),
-            "timestamp": self.current_step_data.get("timestamp"),
-            "has_evaluation": "evaluation" in self.current_step_data,
+            "step": self._current_step_data["step"],
+            "timestamp": self._current_step_data["timestamp"],
+            "has_evaluation": "evaluation" in self._current_step_data,
         }
         try:
             with open(self.steps_jsonl_path, "a") as f:
                 f.write(json.dumps(step_entry) + "\n")
-        except Exception as e:
-            print(f"[Observer] Warning: could not append to steps_summary.jsonl: {e}")
+        except (IOError, OSError) as e:
+            raise IOError(
+                f"Could not append to steps_summary.jsonl:\n{format_exception_msg(e)}"
+            ) from e
 
-        self.current_step_data = {}
+        self._current_step_data = {}
 
     # ------------------------------------------------------------------
     # Error logging
     # ------------------------------------------------------------------
+    @validate
     def log_error(self, step: int, error: str) -> None:
-        """Log an error for the current run.
+        """Log an error. Must NOT raise — called from exception handlers.
 
         Args:
             step: Step number where error occurred.
@@ -469,7 +330,12 @@ class ObservabilityManager:
             with open(self.steps_jsonl_path, "a") as f:
                 f.write(json.dumps(error_entry) + "\n")
         except Exception as e:
-            print(f"[Observer] Error JSONL append failed: {e}")
+            print(
+                f"[Observer] CRITICAL: Error JSONL append failed "
+                f"(original error at step {step} may be lost):\n"
+                f"{format_exception_msg(e)}",
+                file=sys.stderr,
+            )
 
         try:
             with open(self.summary_path, "r") as f:
@@ -481,10 +347,13 @@ class ObservabilityManager:
 
             with open(self.summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
-
-            print(f"[Observer] Error logged → {self.summary_path}")
         except Exception as e:
-            print(f"[Observer] Error summary update failed: {e}")
+            print(
+                f"[Observer] CRITICAL: Error summary update failed "
+                f"(original error at step {step} may be lost):\n"
+                f"{format_exception_msg(e)}",
+                file=sys.stderr,
+            )
 
     # ------------------------------------------------------------------
     # Finalization
@@ -499,7 +368,7 @@ class ObservabilityManager:
             with open(self.steps_jsonl_path, "r") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
+                    if len(line) > 0:
                         entry = json.loads(line)
                         if "type" not in entry or entry["type"] != "error":
                             steps_summary.append(entry)
@@ -510,3 +379,16 @@ class ObservabilityManager:
 
         with open(self.summary_path, "w") as f:
             json.dump(summary, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_step(step_data: Dict[str, Any]) -> Dict[str, Any]:
+        serialized: Dict[str, Any] = {}
+        for k, v in step_data.items():
+            if isinstance(v, (dict, list)):
+                serialized[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                serialized[k] = v
+        return serialized

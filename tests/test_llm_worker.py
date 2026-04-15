@@ -7,6 +7,7 @@ Covers:
 - High-load stress test (100 concurrent calls)
 - Sequential call stability
 """
+
 import time
 
 import pytest
@@ -24,7 +25,9 @@ class TestLLMWorkerCalls:
 
     def test_single_call(self, task_llm):
         """Single async call returns a non-empty string."""
-        result = task_llm.call_llm(prompt="Say hello in one sentence.").result(timeout=30)
+        result = task_llm.call_llm(prompt="Say hello in one sentence.").result(
+            timeout=30
+        )
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -36,7 +39,9 @@ class TestLLMWorkerCalls:
     def test_batch_5(self, task_llm):
         """Small batch of 5 concurrent calls all succeed."""
         prompts = [EVAL_PROMPT] * 5
-        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(timeout=60)
+        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(
+            timeout=60
+        )
         assert len(results) == 5
         valid = sum(1 for r in results if "fluency" in str(r).lower())
         assert valid == 5
@@ -44,7 +49,9 @@ class TestLLMWorkerCalls:
     def test_batch_50(self, task_llm):
         """Realistic batch of 50 concurrent calls (matches runner.py batch_size=48)."""
         prompts = [EVAL_PROMPT] * 50
-        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(timeout=120)
+        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(
+            timeout=120
+        )
         assert len(results) == 50
         valid = sum(1 for r in results if "fluency" in str(r).lower())
         assert valid >= 45, f"Only {valid}/50 responses contained valid JSON"
@@ -64,7 +71,9 @@ class TestHighLoad:
         """100 concurrent calls complete successfully."""
         prompts = [EVAL_PROMPT] * 100
         t0 = time.time()
-        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(timeout=300)
+        results = task_llm.call_llm_batch(prompts=prompts, verbosity=0).result(
+            timeout=300
+        )
         elapsed = time.time() - t0
 
         assert len(results) == 100

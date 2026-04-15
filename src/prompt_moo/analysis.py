@@ -1,146 +1,22 @@
 import os
-import pandas as pd
-import numpy as np
 
-import hvplot.pandas  # required for hvplot
 import holoviews as hv
+import pandas as pd
 
 hv.extension("bokeh")
 
-from typing import Dict, List, Optional, Tuple, ClassVar
-from morphic import Typed, Registry
+from typing import ClassVar, Dict, List, Optional, Tuple
+
+from morphic import Registry, Typed, validate
 from morphic.typed import format_exception_msg
 
-from .data_structures import TaskMetricResult, StepMultiMetricResult
 from .context_manager import ExptRunContext, SingleRunContext
+from .data_structures import StepMultiMetricResult, TaskMetricResult
+from .metrics import F1, Accuracy, Metric, Precision, Recall  # noqa: F401 (re-exported)
 
 
 class Analysis(Typed, Registry):
     _allow_subclass_override: ClassVar[bool] = True
-
-
-####################### METRIC SUBCLASS #######################
-
-
-class Metric(Analysis):
-    """
-    Base metric class.
-    """
-
-    name: str
-
-    def compute(self, y_true, y_pred) -> float:
-        raise NotImplementedError
-
-
-class Accuracy(Metric):
-    """
-    Accuracy metric.
-    """
-
-    name: str = "accuracy"
-
-    def compute(self, y_true, y_pred) -> float:
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
-
-        if len(y_true) != len(y_pred):
-            raise ValueError("y_true and y_pred must have the same length")
-
-        if len(y_true) == 0:
-            return 0.0
-
-        return float((y_true == y_pred).mean())
-
-
-class Precision(Metric):
-    name: str = "precision"
-
-    def compute(self, y_true, y_pred) -> float:
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
-
-        mask = ~pd.isna(y_true) & ~pd.isna(y_pred)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-
-        if len(y_true) == 0:
-            return 0.0
-
-        classes = np.unique(np.concatenate([y_true, y_pred]))
-        precisions = []
-
-        for cls in classes:
-            tp = np.sum((y_true == cls) & (y_pred == cls))
-            fp = np.sum((y_true != cls) & (y_pred == cls))
-
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            precisions.append(precision)
-
-        return float(np.mean(precisions))
-
-
-class Recall(Metric):
-    name: str = "recall"
-
-    def compute(self, y_true, y_pred) -> float:
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
-
-        mask = ~pd.isna(y_true) & ~pd.isna(y_pred)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-
-        if len(y_true) == 0:
-            return 0.0
-
-        classes = np.unique(np.concatenate([y_true, y_pred]))
-        recalls = []
-
-        for cls in classes:
-            tp = np.sum((y_true == cls) & (y_pred == cls))
-            fn = np.sum((y_true == cls) & (y_pred != cls))
-
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            recalls.append(recall)
-
-        return float(np.mean(recalls))
-
-
-class F1(Metric):
-    name: str = "f1"
-    average: str = "macro"
-
-    def compute(self, y_true, y_pred) -> float:
-        y_true = np.array(y_true)
-        y_pred = np.array(y_pred)
-
-        mask = ~pd.isna(y_true) & ~pd.isna(y_pred)
-        y_true = y_true[mask]
-        y_pred = y_pred[mask]
-
-        if len(y_true) == 0:
-            return 0.0
-
-        classes = np.unique(np.concatenate([y_true, y_pred]))
-        f1_scores = []
-
-        for cls in classes:
-            tp = np.sum((y_true == cls) & (y_pred == cls))
-            fp = np.sum((y_true != cls) & (y_pred == cls))
-            fn = np.sum((y_true == cls) & (y_pred != cls))
-
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-
-            if precision + recall == 0:
-                f1 = 0.0
-            else:
-                f1 = 2 * precision * recall / (precision + recall)
-
-            f1_scores.append(f1)
-
-        return float(np.mean(f1_scores))
 
 
 ###################### VISUALIZATION SUBCLASS ##############################
@@ -180,7 +56,7 @@ class LinePlot(Visualizer):
             task_df = self.df[self.df["task_name"] == task].sort_values("step")
 
             color = None
-            if self.metric_colors:
+            if self.metric_colors is not None:
                 color = self.metric_colors.get(task)
 
             # Line (Curve)
@@ -241,7 +117,7 @@ class HeatmapPlot(Visualizer):
 
         try:
             eval_df = pd.read_parquet(parquet_path, engine="pyarrow")
-        except Exception as e:
+        except (IOError, OSError) as e:
             raise IOError(f"Failed to read parquet: {format_exception_msg(e)}")
 
         dataset_tasks = tuple(self.run_ctx.dataset_config["task_output_formats"].keys())
@@ -350,6 +226,7 @@ class ExptEvaluator(Typed, Registry):
     _allow_subclass_override: ClassVar[bool] = True
 
     @staticmethod
+    @validate
     def compute_all_metrics(
         *,
         parquet_path: str,
@@ -366,24 +243,21 @@ class ExptEvaluator(Typed, Registry):
 
         try:
             eval_df = pd.read_parquet(parquet_path, engine="pyarrow")
-        except Exception as e:
+        except (IOError, OSError) as e:
             raise IOError(
                 f"Failed to read evaluation parquet at {parquet_path!r}:\n"
                 f"{format_exception_msg(e)}"
             ) from e
         task_results: List[TaskMetricResult] = []
 
-        # Metric registry
-        metric_map = {
-            "accuracy": Accuracy.of(),
-            "f1": F1.of(),
-            "precision": Precision.of(),
-            "recall": Recall.of(),
-        }
-
         for m in metrics:
-            if m not in metric_map:
-                raise ValueError(f"Unsupported metric: {m}")
+            try:
+                Metric.get_subclass(m)
+            except (KeyError, ValueError):
+                raise ValueError(
+                    f"Unsupported metric: {m!r}. "
+                    f"Register it as a Metric subclass in metrics.py."
+                )
 
         for t in tasks:
             gt = f"gt_{t}"
@@ -411,7 +285,10 @@ class ExptEvaluator(Typed, Registry):
             metric_values = {}
 
             for m in metrics:
-                metric_values[m] = metric_map[m].compute(y_true, y_pred)
+                metric_cls = Metric.get_subclass(m)
+                metric_values[m] = metric_cls.compute(
+                    y_true=list(y_true), y_pred=list(y_pred)
+                )
 
             task_results.append(
                 TaskMetricResult.of(
@@ -429,6 +306,7 @@ class ExptEvaluator(Typed, Registry):
         )
 
     @staticmethod
+    @validate
     def generate_single_run_df(
         *,
         run_ctx: SingleRunContext,
@@ -486,22 +364,16 @@ class ExptEvaluator(Typed, Registry):
 
 
 if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, "expt")
+    from dataset import SummEval
+
     mega_dir_path = "./outputs/All_Together_B48_L3_G4/"
     dirs: List[str] = ["2", "3", "4", "5_5", "6"]
     dataset_config = {
-        "prompt_prefix": "Evaluate the summary. Output JSON with the requested metric scores. Do NOT include reasoning or explanations. Each metric should contain a single integer. Formats like '4/5' or '4|5' are invalid.",
-        "task_output_formats": {
-            "fluency": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "coherence": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "relevance": "An integer between 1 to 5",  # "1|2|3|4|5",
-            "consistency": "An integer between 1 to 5",  # "1|2|3|4|5",
-        },
-        "task_losses": {
-            "fluency": "accuracy",
-            "coherence": "accuracy",
-            "relevance": "accuracy",
-            "consistency": "accuracy",
-        },
+        "task_output_formats": SummEval.task_output_formats,
+        "task_losses": SummEval.task_losses,
     }
 
     for dir in dirs:

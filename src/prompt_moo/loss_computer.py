@@ -5,12 +5,12 @@ This is Step 2 of the optimization pipeline.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, Union
 
-import numpy as np
-from morphic import Registry, Typed
-from sklearn.metrics import f1_score
+from morphic import Registry, Typed, validate
+from morphic.typed import format_exception_msg
 
+from .config import promptmoo_config
 from .data_structures import (
     DatasetSample,
     NumericFeedback,
@@ -18,16 +18,14 @@ from .data_structures import (
     Task,
     TextualFeedback,
 )
-from .config import promptmoo_config
 from .llm_utils import apply_prompt_suffix
+from .metrics import Metric
+from .prompt_template import PromptTemplate
 
 # Export validator for use when creating LLM pools
 __all__ = [
     "LossComputer",
     "TaskLevelLossComputer",
-    "OPROLossComputer",
-    "GPOLossComputer",
-    "TextGradLossComputer",
     "validate_loss_feedback_response",
 ]
 
@@ -60,10 +58,15 @@ class LossComputer(Typed, Registry, ABC):
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
         tasks: List[Task],
-        llm_pool: Optional[Any],
+        prompt_template: PromptTemplate,
+        llm_pool: Optional[Any],  # LLMPool protocol; see types.py
         loss_batch_size: int,
         verbosity: int = 1,
-        **kwargs: Dict[str, Any],
+        *,
+        loss_functions: Optional[Dict[str, Dict[str, Any]]] = None,
+        input_col_labels: Optional[Dict[str, str]] = None,
+        loss_task_strategy: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
         """Compute feedback for predictions.
 
@@ -71,10 +74,16 @@ class LossComputer(Typed, Registry, ABC):
             predictions: List of prediction results from task predictor
             ground_truths: List of dataset samples with ground truth values
             tasks: List of tasks to compute losses for
+            prompt_template: Current prompt template (used for the actual optimized
+                instruction text in textual feedback prompts)
             llm_pool: Optional LLM pool for computing textual feedback
             loss_batch_size: Batch size for grouping predictions/samples
             verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Algorithm-specific context (e.g., loss_functions config)
+            loss_functions: Dict mapping task_name to loss function config
+            input_col_labels: Dict mapping column names to display labels
+            loss_task_strategy: Multi-task loss strategy (e.g., "separate_tasks",
+                "combine_all_tasks")
+            **kwargs: Algorithm-specific context
 
         Returns:
             Dict with:
@@ -83,120 +92,27 @@ class LossComputer(Typed, Registry, ABC):
         """
         pass
 
-
-class TaskLevelLossComputer(LossComputer):
-    """Compute losses independently per task."""
-
-    aliases = ["task-level", "independent"]
-
-    def compute(
-        self,
-        predictions: List[PredictionResult],
-        ground_truths: List[DatasetSample],
-        tasks: List[Task],
-        llm_pool: Optional[Any],
-        loss_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
-        """Compute losses independently for each task.
-
-        Args:
-            predictions: Prediction results
-            ground_truths: Ground truth samples
-            tasks: Tasks to compute losses for
-            llm_pool: Optional LLM for textual feedback
-            loss_batch_size: Loss batch size
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Must contain 'loss_functions' dict mapping task_name to config
-
-        Returns:
-            Dict mapping task_name to list of feedback objects
-        """
-        loss_functions = kwargs.get("loss_functions", {})
-        result = {}
-
-        for task in tasks:
-            if task.task_name not in loss_functions:
-                continue
-
-            loss_fn_config = loss_functions[task.task_name]
-
-            # Batch predictions for this task
-            task_batches = self._batch_predictions(
-                predictions=predictions,
-                ground_truths=ground_truths,
-                task=task,
-                batch_size=loss_batch_size,
-            )
-
-            feedbacks = []
-
-            # First compute all numeric losses
-            for pred_batch, gt_batch in task_batches:
-                numeric = self._compute_numeric_loss(
-                    predictions=pred_batch,
-                    ground_truths=gt_batch,
-                    task=task,
-                    loss_fn_config=loss_fn_config,
-                )
-                if numeric is not None:
-                    feedbacks.append(numeric)
-
-            # Optionally compute textual feedback via LLM (batched)
-            if llm_pool is not None and loss_fn_config.get("use_textual", False):
-                # Build all prompts first
-                prompts = []
-                for pred_batch, gt_batch in task_batches:
-                    feedback_prompt = self._build_feedback_prompt(
-                        predictions=pred_batch,
-                        ground_truths=gt_batch,
-                        task=task,
-                        loss_fn_config=loss_fn_config,
-                    )
-                    prompts.append(feedback_prompt)
-
-                # Call LLM with all prompts in a single batch
-                if len(prompts) > 0:
-                    try:
-                        prompts = apply_prompt_suffix(prompts, llm_pool)
-                        cfg = promptmoo_config.defaults
-                        responses = llm_pool.call_llm_batch(
-                            prompts=prompts, verbosity=verbosity
-                        ).result(timeout=cfg.batch_invocation_timeout)
-
-                        for (pred_batch, _gt_batch), response in zip(
-                            task_batches, responses
-                        ):
-                            sample_ids = [p.sample_id for p in pred_batch]
-                            textual = TextualFeedback(
-                                task_name=task.task_name,
-                                feedback_text=response,
-                                aggregated_from_samples=sample_ids,
-                                feedback_prompt=None,
-                            )
-                            feedbacks.append(textual)
-                    except Exception:
-                        pass
-
-            result[task] = feedbacks
-
-        return result
-
-    def _batch_predictions(
-        self,
+    @staticmethod
+    @validate
+    def batch_predictions(
         *,
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
         task: Task,
         batch_size: int,
     ) -> List[Tuple[List[PredictionResult], List[DatasetSample]]]:
-        """Batch predictions for a specific task.
+        """Split predictions and ground truths into batches for a specific task.
+
+        Args:
+            predictions: Full list of prediction results.
+            ground_truths: Full list of ground truth samples.
+            task: Task object (unused currently, reserved for future filtering).
+            batch_size: Number of samples per batch.
 
         Returns:
-            List of (prediction_batch, ground_truth_batch) tuples
+            List of (prediction_batch, ground_truth_batch) tuples.
         """
-        batches = []
+        batches: List[Tuple[List[PredictionResult], List[DatasetSample]]] = []
         for i in range(0, len(predictions), batch_size):
             pred_batch = predictions[i : i + batch_size]
             gt_batch = ground_truths[i : i + batch_size]
@@ -211,100 +127,222 @@ class TaskLevelLossComputer(LossComputer):
         task: Task,
         loss_fn_config: dict,
     ) -> Optional[NumericFeedback]:
-        """Compute numeric loss for a batch.
+        """Compute numeric loss for a batch using the Metric registry.
+
+        Resolves the metric name from ``loss_fn_config["metric"]`` to a
+        ``Metric`` subclass via ``Metric.get_subclass()``, extracts
+        y_true/y_pred arrays, computes the value, and wraps the result in
+        a ``NumericFeedback`` containing the ``Metric`` instance.
+
+        Metric-specific kwargs (e.g. ``num_classes`` for LCE) are extracted
+        from ``loss_fn_config`` and forwarded to both ``compute()`` and
+        the ``Metric`` constructor.
 
         Args:
-            predictions: Batch of predictions
-            ground_truths: Batch of ground truths
-            task: Task to compute loss for
-            loss_fn_config: Loss function configuration
+            predictions: Batch of predictions.
+            ground_truths: Batch of ground truths.
+            task: Task to compute loss for.
+            loss_fn_config: Must contain ``"metric"`` key (e.g. ``"accuracy"``).
+                May contain additional metric-specific keys (e.g. ``"num_classes"``
+                for LCE).
 
         Returns:
-            NumericFeedback object or None if computation fails
+            NumericFeedback object, or None if no valid pairs found.
         """
-        metric_name = loss_fn_config.get("metric", "accuracy")
-        metric_name_lower = metric_name.lower()
-
-        # Determine optimization direction
-        if metric_name_lower in ["accuracy", "f1"]:
-            direction = "maximize"
-        else:
-            direction = "minimize"
+        if "metric" not in loss_fn_config:
+            return None
+        metric_name: str = loss_fn_config["metric"]
 
         try:
-            if metric_name_lower in ["accuracy", "acc"]:
-                value = self._compute_accuracy(
-                    predictions, ground_truths, task.task_name
-                )
-            elif metric_name_lower in ["f1"]:
-                value = self._compute_f1(predictions, ground_truths, task.task_name)
-            elif metric_name_lower in ["lce", "ce"]:
-                value = self._compute_lce(predictions, ground_truths, task.task_name)
-            else:
-                return None
+            metric_cls: Type[Metric] = Metric.get_subclass(metric_name)
+        except (KeyError, ValueError) as e:
+            raise ValueError(
+                f"{self.__class__.__name__}: unknown metric {metric_name!r}. "
+                f"Register it as a Metric subclass in metrics.py."
+            ) from e
 
-            sample_ids = [p.sample_id for p in predictions]
-            return NumericFeedback(
-                task_name=task.task_name,
-                metric_name=metric_name,
-                value=value,
-                optimization_direction=direction,
-                aggregated_from_samples=sample_ids,
-            )
-        except Exception:
+        metric_kwargs: Dict[str, Any] = {
+            k: v
+            for k, v in loss_fn_config.items()
+            if k not in ("metric", "use_textual")
+        }
+
+        y_true: List[Any]
+        y_pred: List[Any]
+        y_true, y_pred = self._extract_task_arrays(
+            predictions=predictions,
+            ground_truths=ground_truths,
+            task_name=task.task_name,
+        )
+        if len(y_true) == 0:
             return None
 
-    def _compute_accuracy(
-        self,
-        predictions: List[PredictionResult],
-        ground_truths: List[DatasetSample],
-        task_name: str,
-    ) -> float:
-        """Compute accuracy."""
-        correct = 0
-        total = 0
-        for pred, gt in zip(predictions, ground_truths):
-            if task_name in pred.task_outputs and task_name in gt.ground_truths:
-                if pred.task_outputs[task_name] == gt.ground_truths[task_name]:
-                    correct += 1
-                total += 1
-        return correct / total if total > 0 else 0.0
+        try:
+            value: float = metric_cls.compute(
+                y_true=y_true, y_pred=y_pred, **metric_kwargs
+            )
+            metric_instance: Metric = metric_cls(value=value, **metric_kwargs)
+            sample_ids: List[str] = [p.sample_id for p in predictions]
+            return NumericFeedback(
+                task_name=task.task_name,
+                metric=metric_instance,
+                aggregated_from_samples=sample_ids,
+            )
+        except (KeyError, ValueError, ZeroDivisionError) as e:
+            raise RuntimeError(
+                f"{self.__class__.__name__}: numeric loss computation "
+                f"failed for task {task.task_name} ({metric_name}):\n{format_exception_msg(e)}"
+            ) from e
 
-    def _compute_f1(
-        self,
+    @staticmethod
+    def _extract_task_arrays(
+        *,
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
         task_name: str,
-    ) -> float:
-        """Compute F1 score."""
-        y_true = []
-        y_pred = []
+    ) -> Tuple[List[Any], List[Any]]:
+        """Extract aligned (y_true, y_pred) lists for a single task.
+
+        Skips samples where either the prediction or the ground truth is
+        missing for the given task.
+
+        Args:
+            predictions: Batch of prediction results.
+            ground_truths: Batch of ground truth samples.
+            task_name: Task to extract values for.
+
+        Returns:
+            Tuple of (y_true, y_pred) lists with matching lengths.
+        """
+        y_true: List[Any] = []
+        y_pred: List[Any] = []
         for pred, gt in zip(predictions, ground_truths):
             if task_name in pred.task_outputs and task_name in gt.ground_truths:
                 y_true.append(gt.ground_truths[task_name])
                 y_pred.append(pred.task_outputs[task_name])
+        return y_true, y_pred
 
-        if len(y_true) == 0:
-            return 0.0
 
-        return float(f1_score(y_true=y_true, y_pred=y_pred, average="macro"))
+class TaskLevelLossComputer(LossComputer):
+    """Compute losses independently per task."""
 
-    def _compute_lce(
+    aliases = ["task-level", "independent"]
+
+    @validate
+    def compute(
         self,
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
-        task_name: str,
-    ) -> float:
-        """Compute log cross-entropy."""
-        losses = []
-        for pred, gt in zip(predictions, ground_truths):
-            if task_name in pred.task_outputs and task_name in gt.ground_truths:
-                pred_val = pred.task_outputs[task_name]
-                # Normalize to probability
-                prob = pred_val / 5.0
-                losses.append(-np.log(prob + 1e-12))
+        tasks: List[Task],
+        prompt_template: PromptTemplate,
+        llm_pool: Optional[Any],  # LLMPool protocol; see types.py
+        loss_batch_size: int,
+        verbosity: int = 1,
+        *,
+        loss_functions: Optional[Dict[str, Dict[str, Any]]] = None,
+        input_col_labels: Optional[Dict[str, str]] = None,
+        loss_task_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
+        """Compute losses independently for each task.
 
-        return float(np.mean(losses)) if len(losses) > 0 else 0.0
+        Args:
+            predictions: Prediction results
+            ground_truths: Ground truth samples
+            tasks: Tasks to compute losses for
+            prompt_template: Current prompt template (carries the optimized instruction)
+            llm_pool: Optional LLM for textual feedback
+            loss_batch_size: Loss batch size
+            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
+            loss_functions: Dict mapping task_name to loss function config
+            input_col_labels: Dict mapping column names to display labels (unused)
+            loss_task_strategy: Multi-task loss strategy (unused)
+            **kwargs: Additional algorithm-specific context
+
+        Returns:
+            Dict mapping task_name to list of feedback objects
+        """
+        if loss_functions is None:
+            raise ValueError(
+                f"{self.__class__.__name__}.compute() requires 'loss_functions'"
+            )
+        result: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]] = {}
+
+        for task in tasks:
+            if task.task_name not in loss_functions:
+                raise ValueError(
+                    f"{self.__class__.__name__}: task {task.task_name!r} not found "
+                    f"in loss_functions. Available: {list(loss_functions.keys())}"
+                )
+
+            loss_fn_config: Dict[str, Any] = loss_functions[task.task_name]
+
+            task_batches: List[Tuple[List[PredictionResult], List[DatasetSample]]] = (
+                LossComputer.batch_predictions(
+                    predictions=predictions,
+                    ground_truths=ground_truths,
+                    task=task,
+                    batch_size=loss_batch_size,
+                )
+            )
+
+            feedbacks: List[Union[NumericFeedback, TextualFeedback]] = []
+
+            # First compute all numeric losses
+            for pred_batch, gt_batch in task_batches:
+                numeric: Optional[NumericFeedback] = self._compute_numeric_loss(
+                    predictions=pred_batch,
+                    ground_truths=gt_batch,
+                    task=task,
+                    loss_fn_config=loss_fn_config,
+                )
+                if numeric is not None:
+                    feedbacks.append(numeric)
+
+            # Optionally compute textual feedback via LLM (batched)
+            if llm_pool is not None and loss_fn_config.get("use_textual") is True:
+                # Build all prompts first
+                prompts: List[str] = []
+                for pred_batch, gt_batch in task_batches:
+                    feedback_prompt: str = self._build_feedback_prompt(
+                        predictions=pred_batch,
+                        ground_truths=gt_batch,
+                        task=task,
+                        prompt_template=prompt_template,
+                        loss_fn_config=loss_fn_config,
+                    )
+                    prompts.append(feedback_prompt)
+
+                # Call LLM with all prompts in a single batch
+                if len(prompts) > 0:
+                    try:
+                        prompts = apply_prompt_suffix(prompts, llm_pool)
+                        responses = llm_pool.call_llm_batch(
+                            prompts=prompts, verbosity=verbosity
+                        ).result(
+                            timeout=promptmoo_config.defaults.batch_invocation_timeout
+                        )
+
+                        for (pred_batch, _gt_batch), prompt, response in zip(
+                            task_batches, prompts, responses
+                        ):
+                            sample_ids: List[str] = [p.sample_id for p in pred_batch]
+                            textual: TextualFeedback = TextualFeedback(
+                                task_name=task.task_name,
+                                feedback_text=response,
+                                aggregated_from_samples=sample_ids,
+                                feedback_prompt=prompt,
+                            )
+                            feedbacks.append(textual)
+                    except (RuntimeError, TimeoutError, ValueError) as e:
+                        raise RuntimeError(
+                            f"{self.__class__.__name__}: textual feedback LLM call "
+                            f"failed for task {task.task_name}:\n{format_exception_msg(e)}"
+                        ) from e
+
+            result[task] = feedbacks
+
+        return result
 
     def _build_feedback_prompt(
         self,
@@ -312,13 +350,22 @@ class TaskLevelLossComputer(LossComputer):
         predictions: List[PredictionResult],
         ground_truths: List[DatasetSample],
         task: Task,
+        prompt_template: PromptTemplate,
         loss_fn_config: dict,
     ) -> str:
-        """Build prompt for textual feedback generation."""
+        """Build prompt for textual feedback generation.
+
+        Uses the current optimized instruction from ``prompt_template`` rather
+        than the frozen ``task.task_instruction`` so the loss LLM evaluates
+        predictions against the instruction the task LLM actually received.
+        """
+        current_instruction: str = self._get_current_instruction(
+            task=task, prompt_template=prompt_template
+        )
         prompt = f"""You are given evaluation results for the task: {task.task_name}
 
 Task Description: {task.task_description}
-Task Instruction: {task.task_instruction}
+Task Instruction: {current_instruction}
 
 Analyze the following predictions and ground truths, and provide feedback on what's wrong:
 
@@ -333,276 +380,16 @@ Analyze the following predictions and ground truths, and provide feedback on wha
         prompt += "\nProvide 2-3 sentences of feedback on what's wrong with these predictions:"
         return prompt
 
+    @staticmethod
+    def _get_current_instruction(
+        *,
+        task: Task,
+        prompt_template: PromptTemplate,
+    ) -> str:
+        """Return the current optimized instruction for *task*.
 
-class OPROLossComputer(LossComputer):
-    """OPRO-specific: only numeric losses, no textual feedback."""
-
-    aliases = ["opro"]
-
-    def compute(
-        self,
-        predictions: List[PredictionResult],
-        ground_truths: List[DatasetSample],
-        tasks: List[Task],
-        llm_pool: Optional[Any],
-        loss_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
-        """Compute only numeric losses for OPRO.
-
-        Args:
-            predictions: Prediction results
-            ground_truths: Ground truth samples
-            tasks: Tasks to compute losses for
-            llm_pool: Unused (OPRO doesn't use textual feedback)
-            loss_batch_size: Batch size for processing predictions
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Must contain 'loss_functions' dict
-
-        Returns:
-            Dict mapping task_name to list of NumericFeedback objects
+        Reads from the prompt template's ``instruction`` dict.  Raises
+        ``KeyError`` if the task is missing — this indicates a broken
+        prompt template, not a condition to fall back from.
         """
-        # OPRO doesn't use textual feedback
-        if llm_pool is not None:
-            pass  # Ignore, don't assert to allow flexibility
-
-        loss_functions = kwargs.get("loss_functions", {})
-        result = {}
-
-        # Use TaskLevelLossComputer's methods
-        task_computer = TaskLevelLossComputer()
-
-        for task in tasks:
-            if task.task_name not in loss_functions:
-                continue
-
-            loss_fn_config = loss_functions[task.task_name]
-
-            # Batch predictions for this task
-            task_batches = task_computer._batch_predictions(
-                predictions=predictions,
-                ground_truths=ground_truths,
-                task=task,
-                batch_size=loss_batch_size,
-            )
-
-            feedbacks = []
-            for pred_batch, gt_batch in task_batches:
-                # Compute numeric loss for each batch
-                numeric = task_computer._compute_numeric_loss(
-                    predictions=pred_batch,
-                    ground_truths=gt_batch,
-                    task=task,
-                    loss_fn_config=loss_fn_config,
-                )
-                if numeric is not None:
-                    feedbacks.append(numeric)
-
-            result[task] = feedbacks
-
-        return result
-
-
-class GPOLossComputer(LossComputer):
-    """
-    GPO-specific Loss Computer:
-    - Computes numeric feedback
-    - Optionally uses LLM to generate textual feedback (like TaskLevel)
-    - Designed to be light-weight and multi-task aware
-    """
-
-    aliases = ["gpo"]
-
-    def compute(
-        self,
-        predictions: List[PredictionResult],
-        ground_truths: List[DatasetSample],
-        tasks: List[Task],
-        llm_pool: Optional[Any],
-        loss_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
-        """
-        Compute feedback for GPO
-        - Numeric for Task (always)
-        - Textual feedback if llm_pool is provided and enabled for that task
-        """
-
-        loss_functions = kwargs.get("loss_functions", {})
-        if verbosity >= 2:
-            print(loss_functions)
-        result: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]] = {}
-
-        task_computer = TaskLevelLossComputer()
-
-        for task in tasks:
-            if task.task_name not in loss_functions:
-                continue
-
-            loss_fn_config = loss_functions[task.task_name]
-
-            # Batch predictions for this task
-            task_batches = task_computer._batch_predictions(
-                predictions=predictions,
-                ground_truths=ground_truths,
-                task=task,
-                batch_size=loss_batch_size,
-            )
-
-            feedbacks = []
-
-            # First compute all numeric losses
-            for pred_batch, gt_batch in task_batches:
-                numeric = task_computer._compute_numeric_loss(
-                    predictions=pred_batch,
-                    ground_truths=gt_batch,
-                    task=task,
-                    loss_fn_config=loss_fn_config,
-                )
-                if numeric is not None:
-                    feedbacks.append(numeric)
-
-            # Optionally compute textual feedback via LLM (batched)
-            if llm_pool is not None and loss_fn_config.get("use_textual", False):
-                # Build all prompts first
-                prompts = []
-                for pred_batch, gt_batch in task_batches:
-                    feedback_prompt = task_computer._build_feedback_prompt(
-                        predictions=pred_batch,
-                        ground_truths=gt_batch,
-                        task=task,
-                        loss_fn_config=loss_fn_config,
-                    )
-                    prompts.append(feedback_prompt)
-
-                # Call LLM with all prompts in a single batch
-                if len(prompts) > 0:
-                    try:
-                        prompts = apply_prompt_suffix(prompts, llm_pool)
-                        cfg = promptmoo_config.defaults
-                        responses = llm_pool.call_llm_batch(
-                            prompts=prompts, verbosity=verbosity
-                        ).result(timeout=cfg.batch_invocation_timeout)
-
-                        for (pred_batch, _gt_batch), response in zip(
-                            task_batches, responses
-                        ):
-                            sample_ids = [p.sample_id for p in pred_batch]
-                            textual = TextualFeedback(
-                                task_name=task.task_name,
-                                feedback_text=response,
-                                aggregated_from_samples=sample_ids,
-                                feedback_prompt=None,
-                            )
-                            feedbacks.append(textual)
-                    except Exception:
-                        pass
-
-            result[task] = feedbacks
-
-        return result
-
-
-class TextGradLossComputer(LossComputer):
-    """
-    TextGrad-specific Loss Computer:
-    - Computes textual feedback only (no numeric metrics)
-    - Uses LLM to generate rich textual feedback for gradient computation
-    - Designed for natural language optimization signals
-    """
-
-    aliases = ["textgrad"]
-
-    def compute(
-        self,
-        predictions: List[PredictionResult],
-        ground_truths: List[DatasetSample],
-        tasks: List[Task],
-        llm_pool: Optional[Any],
-        loss_batch_size: int,
-        verbosity: int = 1,
-        **kwargs,
-    ) -> Dict[Task, List[Union[NumericFeedback, TextualFeedback]]]:
-        """
-        Compute textual feedback for TextGrad.
-
-        Args:
-            predictions: Model predictions
-            ground_truths: Ground truth samples
-            tasks: List of tasks to compute feedback for
-            llm_pool: LLM worker pool for generating textual feedback
-            loss_batch_size: Batch size for processing predictions
-            verbosity: 0=silent, 1=default, 2=detailed, 3=debug (with LLM I/O)
-            **kwargs: Additional context (should contain 'loss_functions')
-
-        Returns:
-            Dict mapping task names to list of TextualFeedback objects
-        """
-        if llm_pool is None:
-            raise ValueError(
-                "TextGrad requires an LLM pool for textual feedback generation"
-            )
-
-        loss_functions = kwargs.get("loss_functions", {})
-        result: Dict[Task, List[Union[NumericFeedback, TextualFeedback]]] = {}
-
-        task_computer = TaskLevelLossComputer()
-
-        for task in tasks:
-            task_name = task.task_name
-
-            if task_name not in loss_functions:
-                if verbosity >= 2:
-                    print(f"Task {task_name} not found")
-                continue
-
-            loss_fn_config = loss_functions[task_name]
-
-            # Batch predictions for this task
-            task_batches = task_computer._batch_predictions(
-                predictions=predictions,
-                ground_truths=ground_truths,
-                task=task,
-                batch_size=loss_batch_size,
-            )
-
-            # TextGrad only uses textual feedback - build all prompts first
-            prompts = []
-            for pred_batch, gt_batch in task_batches:
-                feedback_prompt = task_computer._build_feedback_prompt(
-                    predictions=pred_batch,
-                    ground_truths=gt_batch,
-                    task=task,
-                    loss_fn_config=loss_fn_config,
-                )
-                prompts.append(feedback_prompt)
-
-            # Call LLM with all prompts in a single batch
-            feedbacks: List[Union[NumericFeedback, TextualFeedback]] = []
-            if len(prompts) > 0:
-                try:
-                    prompts = apply_prompt_suffix(prompts, llm_pool)
-                    cfg = promptmoo_config.defaults
-                    responses = llm_pool.call_llm_batch(
-                        prompts=prompts, verbosity=verbosity
-                    ).result(timeout=cfg.batch_invocation_timeout)
-
-                    for (pred_batch, _gt_batch), response in zip(
-                        task_batches, responses
-                    ):
-                        sample_ids = [p.sample_id for p in pred_batch]
-                        textual = TextualFeedback(
-                            task_name=task.task_name,
-                            feedback_text=response,
-                            aggregated_from_samples=sample_ids,
-                            feedback_prompt=None,
-                        )
-                        feedbacks.append(textual)
-                except Exception:
-                    pass
-
-            result[task] = feedbacks
-
-        return result
+        return prompt_template.instruction[task.task_name]

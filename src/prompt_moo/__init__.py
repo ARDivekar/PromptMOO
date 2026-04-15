@@ -15,60 +15,61 @@ Key Components:
 - observability: Structured logging and output management
 """
 
-# Core algorithm classes
-from .algorithm import GPO, OPRO, PromptAlgorithm, TextGrad
+# Base algorithm class
+# Concrete algorithm classes + their co-located components
+from .algorithm import (
+    GPO,
+    OPRO,
+    TextGrad,
+)
 
 # Configuration
 from .config import PromptMOOConfig, PromptMOODefaults, promptmoo_config, temp_config
 
+# Supporting modules
+from .data_input import Dataset
+
 # Data structures
 from .data_structures import (
+    AlgoMetricSeries,
     Batch,
     CombinedFeedback,
     DatasetSample,
+    ExptMetricReport,
     NumericFeedback,
+    OptimizerResult,
     PredictionResult,
+    StepMetricResult,
     Task,
     TextGradient,
     TextualFeedback,
-    AlgoMetricSeries,
-    ExptMetricReport,
-    StepMetricResult,
-)
-
-# Pipeline components
-from .task_predictor import StandardTaskPredictor, TaskPredictor
-from .loss_computer import (
-    GPOLossComputer,
-    LossComputer,
-    OPROLossComputer,
-    TaskLevelLossComputer,
-    TextGradLossComputer,
 )
 from .gradient_computer import (
     GradientComputer,
-    GPOGradientComputer,
-    OPROGradientComputer,
     StandardGradientComputer,
-    TextGradGradientComputer,
 )
-from .prompt_optimizer import (
-    GPOOptimizer,
-    LLMBasedOptimizer,
-    OPROOptimizer,
-    PromptOptimizer,
-    TextGradOptimizer,
+from .loss_computer import (
+    LossComputer,
+    TaskLevelLossComputer,
 )
-
-# Supporting modules
-from .data_input import Dataset
-from .prompt_template_utils import PromptTemplate
+from .metrics import F1, LCE, Accuracy, Metric, Precision, Recall
 from .observability import ObservabilityManager
+from .prompt_algorithm import PromptAlgorithm, should_evaluate_at_step
+from .prompt_optimizer import (
+    LLMBasedOptimizer,
+    PromptOptimizer,
+)
+from .prompt_template import PromptTemplate
 from .prompt_trajectory import PromptTrajectory, TrajectoryElement
+from .task_output_spec import TaskOutputSpec
+
+# Pipeline base classes and shared implementations
+from .task_predictor import StandardTaskPredictor, TaskPredictor
 
 __all__ = [
     # Algorithms
     "PromptAlgorithm",
+    "should_evaluate_at_step",
     "OPRO",
     "GPO",
     "TextGrad",
@@ -86,28 +87,33 @@ __all__ = [
     "TextualFeedback",
     "CombinedFeedback",
     "TextGradient",
-    # Pipeline components
+    "OptimizerResult",
+    # Pipeline components (base + shared)
     "TaskPredictor",
     "StandardTaskPredictor",
     "LossComputer",
     "TaskLevelLossComputer",
-    "OPROLossComputer",
-    "GPOLossComputer",
-    "TextGradLossComputer",
     "GradientComputer",
     "StandardGradientComputer",
-    "OPROGradientComputer",
-    "GPOGradientComputer",
-    "TextGradGradientComputer",
     "PromptOptimizer",
     "LLMBasedOptimizer",
-    "OPROOptimizer",
-    "GPOOptimizer",
-    "TextGradOptimizer",
     # Supporting
     "Dataset",
+    "Metric",
+    "Accuracy",
+    "F1",
+    "Precision",
+    "Recall",
+    "LCE",
     "PromptTemplate",
     "ObservabilityManager",
     "PromptTrajectory",
     "TrajectoryElement",
+    "TaskOutputSpec",
 ]
+
+# Resolve deferred forward references now that all types are defined.
+# OptimizerResult.new_prompt uses a string annotation "PromptTemplate"
+# because prompt_template.py imports from data_structures.py
+# (circular at module level). With all modules loaded, rebuild resolves it.
+OptimizerResult.model_rebuild(_types_namespace={"PromptTemplate": PromptTemplate})

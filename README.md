@@ -48,9 +48,9 @@ PromptMOO is an open-source Python framework for **multi-task prompt optimizatio
 Each step is an abstract base class with algorithm-specific subclasses registered via a typed `Registry`. Swapping algorithms requires changing a single string:
 
 ```python
-LossComputer.of("opro")     # -> OPROLossComputer (numeric only)
-LossComputer.of("gpo")      # -> GPOLossComputer (numeric + textual)
-LossComputer.of("textgrad") # -> TextGradLossComputer (textual only)
+GradientComputer.of("opro")     # -> OPROGradientComputer (score summary, no LLM)
+GradientComputer.of("gpo")      # -> GPOGradientComputer (LLM-generated)
+GradientComputer.of("textgrad") # -> TextGradGradientComputer (LLM-generated)
 ```
 
 ## Algorithm Comparison
@@ -80,7 +80,8 @@ conda create -n prompt_moo python=3.12 -y
 conda activate prompt_moo
 
 # Install dependencies
-pip install -r requirements.txt
+pip install uv
+uv pip install -r requirements.txt
 ```
 
 ### 3. Set up your API key
@@ -122,14 +123,14 @@ Run cells sequentially. The notebook will:
 ### 6. Run tests (optional)
 
 ```bash
-# Unit tests (no API key needed, ~25s)
-python -m pytest tests/ -m unit -v
+# Unit tests (no API key needed)
+pytest --tb=short -rf tests/ -m unit
 
-# Integration tests (requires API key, ~35s)
-python -m pytest tests/ -m integration -v
+# Integration tests (requires API key)
+pytest --tb=short -rf tests/ -m integration
 
-# Full end-to-end tests (requires API key, ~13 min, runs 2-step training for each algorithm)
-python -m pytest tests/test_e2e.py tests/test_algorithms_e2e.py -v
+# Full end-to-end tests (requires API key, runs 2-step training for each algorithm)
+E2E_STEPS=2 E2E_BATCH_SIZE=3 pytest --tb=short -rf tests/test_e2e_unified.py -s -v --algorithms=opro,gpo,textgrad --timeout=600
 ```
 
 ## Programmatic Usage
@@ -142,10 +143,8 @@ experiments = []
 for algo in ["opro", "gpo", "textgrad"]:
     experiments.append(dict(
         dataset=Dataset.of("SummEval", data_dir="expt/"),
-        algorithm=algo,
-        llm="llama3.1",
-        steps=100,
-        batch_size=24,
+        algo_name=algo,
+        llm="qwen3",
         api_key=os.getenv("OPENROUTER_API_KEY"),
     ))
 
@@ -156,7 +155,7 @@ pool = AlgorithmRunner.options(
 
 futures = {}
 for exp in experiments:
-    futures[exp['algorithm']] = pool.run(**exp)
+    futures[exp['algo_name']] = pool.run(**exp)
 ```
 
 ## Analyzing Results
@@ -186,33 +185,32 @@ run_logs = ObservabilityManager.read_run_logs("outputs/GPO_SummEval_run_XXXXX/")
 ```
 PromptMOO/
 ├── src/prompt_moo/
-│   ├── algorithm.py            # Core 4-step loop + OPRO/GPO/TextGrad implementations
+│   ├── algorithm/              # Algorithm implementations
+│   │   ├── gpo.py              #   GPO (Tang et al., AAAI 2025)
+│   │   ├── opro.py             #   OPRO (Yang et al., ICLR 2024)
+│   │   └── textgrad.py         #   TextGrad (Yuksekgonul et al., 2024)
+│   ├── prompt_algorithm.py     # Core 4-step training loop
 │   ├── config.py               # Centralized configuration (promptmoo_config singleton)
 │   ├── task_predictor.py       # Step 1: Generate predictions via task LLM
 │   ├── loss_computer.py        # Step 2: Compute per-task losses/feedback
 │   ├── gradient_computer.py    # Step 3: Generate per-task textual gradients
 │   ├── prompt_optimizer.py     # Step 4: Update prompt via optimizer LLM
 │   ├── llm_utils.py            # Prompt suffix handling for reasoning-mode models
-│   ├── prompt_template_utils.py # Uni/Multi-objective prompt templates
+│   ├── prompt_template.py      # Multi-task prompt templates
 │   ├── prompt_trajectory.py    # Top-k trajectory tracking for OPRO/GPO
+│   ├── task_output_spec.py     # Output format specifications (ordinal, categorical, etc.)
 │   ├── observability.py        # Per-step Parquet logging of all artifacts
 │   ├── data_structures.py      # Typed data classes (Task, Batch, Feedback, etc.)
 │   ├── data_input.py           # Dataset abstraction
-│   ├── analysis.py             # Post-hoc metrics (Accuracy, F1, Precision, Recall)
+│   ├── metrics.py              # Metric implementations (Accuracy, F1, Precision, Recall)
+│   ├── analysis.py             # Post-hoc evaluation and visualization
 │   └── context_manager.py      # Experiment run discovery and management
 ├── expt/
 │   ├── PromptMOO-Run.ipynb     # Main experiment runner notebook
 │   ├── runner.py               # AlgorithmRunner worker + LLM factory functions
 │   ├── dataset.py              # SummEval, WildGuard, BRIGHTER dataset classes
 │   └── setup_datasets.py       # Dataset preparation script
-├── tests/
-│   ├── test_data_structures.py # Unit tests for data classes
-│   ├── test_config.py          # Unit tests for config system
-│   ├── test_task_predictor.py  # Unit tests for JSON parsing
-│   ├── test_runner.py          # Unit + integration tests for runner
-│   ├── test_llm_worker.py      # Integration tests for LLM workers
-│   ├── test_e2e.py             # End-to-end tests (factory, validator, all roles)
-│   └── test_algorithms_e2e.py  # End-to-end tests (OPRO, GPO, TextGrad training)
+├── tests/                      # 669 unit + integration tests
 ├── .env.example                # Template for API key configuration
 ├── requirements.txt
 ├── LICENSE                     # MIT License
@@ -247,28 +245,21 @@ An `ObservabilityManager` persists every intermediate artifact to per-step Parqu
 - Gradient conflict analysis (cosine similarity of embedded textual gradients)
 - Full reproducibility of optimization trajectories
 
-## Supported Datasets
-
-| Dataset | Domain | Tasks | Type |
-|---|---|---|---|
-| **SummEval** | Summary evaluation | coherence, consistency, fluency, relevance | Ordinal (1-5) |
-| **WildGuard** | Safety evaluation | prompt harm, response harm, refusal | Categorical |
-| **BRIGHTER** | Emotion intensity | anger, fear, joy, sadness, surprise | Ordinal (0-3) |
-
 ## Supported LLMs
 
-PromptMOO supports any LLM accessible via [LiteLLM](https://github.com/BerriAI/litellm). The following configurations are pre-defined in `runner.py`:
+PromptMOO supports 100+ LLMs accessible via [LiteLLM](https://github.com/BerriAI/litellm).
+
+For convenience, the following configurations are pre-defined in `runner.py`:
 
 | Configuration | Task LLM (small) | Optimizer/Gradient/Loss LLM (large) |
 |---|---|---|
 | `llama3.1` | Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct |
 | `qwen3` | Qwen3-8B | Qwen3-235B-A22B |
-| `qwen3.5` | Qwen3.5-9B | Qwen3.5-397B-A17B |
 | `gpt5` | GPT-5-nano | GPT-5.2 |
 | `claude4.5` | Claude Haiku 4.5 | Claude Sonnet 4.5 |
 
-All models are accessed through [OpenRouter](https://openrouter.ai/), which provides unified access and automatic provider failover.
+We suggest to run models through [OpenRouter](https://openrouter.ai/), which provides unified access and automatic provider failover. For demo, please use the provided key.
 
 ## License
 
-This project is licensed under the MIT License -- see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

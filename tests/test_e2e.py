@@ -12,6 +12,7 @@ These tests verify the full PromptMOO pipeline works end-to-end:
 5. The config system correctly parameterizes workers
 6. The task predictor pipeline produces parseable results
 """
+
 import json
 import re
 import time
@@ -21,7 +22,7 @@ import pytest
 from prompt_moo.config import promptmoo_config, temp_config
 from prompt_moo.data_structures import Batch, DatasetSample, PredictionResult, Task
 from prompt_moo.task_predictor import parse_task_response, StandardTaskPredictor
-from prompt_moo.prompt_template_utils import PromptTemplate
+from prompt_moo.prompt_template import PromptTemplate
 
 from tests.conftest import skip_no_api_key
 
@@ -55,8 +56,11 @@ class TestFactoryWorkerRealCalls:
     @pytest.fixture(autouse=True)
     def _setup(self, api_key):
         from runner import create_shared_limits, create_task_llm
+
         self._limits = create_shared_limits()
-        self._llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=self._limits)
+        self._llm = create_task_llm(
+            llm="llama3.1", api_key=api_key, limits=self._limits
+        )
         yield
         self._llm.stop()
 
@@ -90,12 +94,14 @@ class TestFactoryWorkerRealCalls:
         for r in results:
             assert isinstance(r, str)
             assert len(r) > 0
-        print(f"Results: {[r.strip()[:50] for r in results]}")
+        print(f"Results: {[r.strip() for r in results]}")
 
     def test_batch_10_json_responses(self):
         """Batch of 10 evaluation prompts produce JSON-parseable results."""
         prompts = [EVAL_PROMPT] * 10
-        results = self._llm.call_llm_batch(prompts=prompts, verbosity=0).result(timeout=120.0)
+        results = self._llm.call_llm_batch(prompts=prompts, verbosity=0).result(
+            timeout=120.0
+        )
 
         assert len(results) == 10
         valid = sum(1 for r in results if "fluency" in str(r).lower())
@@ -140,6 +146,7 @@ class TestValidatorRealCalls:
         4. Verify the result is a parsed dict, not a raw string
         """
         from runner import create_shared_limits, create_task_llm
+
         limits = create_shared_limits()
         llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=limits)
 
@@ -149,7 +156,9 @@ class TestValidatorRealCalls:
                 validator=parse_task_response,
             ).result(timeout=30.0)
 
-            assert isinstance(result, dict), f"Expected dict, got {type(result).__name__}: {result!r}"
+            assert isinstance(result, dict), (
+                f"Expected dict, got {type(result).__name__}: {result!r}"
+            )
             assert "fluency" in result
             print(f"Parsed result: {result}")
         finally:
@@ -164,10 +173,12 @@ class TestValidatorRealCalls:
         3. Verify the result is an int, not a string
         """
         from runner import create_shared_limits, create_task_llm
+
         limits = create_shared_limits()
         llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=limits)
 
         try:
+
             def extract_number(text: str) -> int:
                 match = re.search(r"\d+", text)
                 if match is None:
@@ -194,6 +205,7 @@ class TestValidatorRealCalls:
         3. Verify all 3 results are parsed dicts
         """
         from runner import create_shared_limits, create_task_llm
+
         limits = create_shared_limits()
         llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=limits)
 
@@ -244,17 +256,24 @@ class TestAllFourRoles:
             create_gradient_llm,
             create_loss_llm,
         )
+
         limits = create_shared_limits()
         workers = {
             "task": create_task_llm(llm="llama3.1", api_key=api_key, limits=limits),
-            "optimizer": create_optimizer_llm(llm="llama3.1", api_key=api_key, limits=limits),
-            "gradient": create_gradient_llm(llm="llama3.1", api_key=api_key, limits=limits),
+            "optimizer": create_optimizer_llm(
+                llm="llama3.1", api_key=api_key, limits=limits
+            ),
+            "gradient": create_gradient_llm(
+                llm="llama3.1", api_key=api_key, limits=limits
+            ),
             "loss": create_loss_llm(llm="llama3.1", api_key=api_key, limits=limits),
         }
 
         try:
             for role, worker in workers.items():
-                result = worker.call_llm(prompt=f"Say '{role}' and nothing else.").result(timeout=60.0)
+                result = worker.call_llm(
+                    prompt=f"Say '{role}' and nothing else."
+                ).result(timeout=60.0)
                 assert isinstance(result, str)
                 assert len(result) > 0
                 print(f"  {role}: {result.strip()!r}")
@@ -293,7 +312,7 @@ class TestConfigIntegration:
                 short_result = short_llm.call_llm(
                     prompt="Write a 500 word essay about cats.",
                 ).result(timeout=30.0)
-                print(f"Short response ({len(short_result)} chars): {short_result[:100]!r}")
+                print(f"Short response ({len(short_result)} chars): {short_result!r}")
             finally:
                 short_llm.stop()
 
@@ -303,7 +322,7 @@ class TestConfigIntegration:
             normal_result = normal_llm.call_llm(
                 prompt="Write a 500 word essay about cats.",
             ).result(timeout=30.0)
-            print(f"Normal response ({len(normal_result)} chars): {normal_result[:100]!r}")
+            print(f"Normal response ({len(normal_result)} chars): {normal_result!r}")
         finally:
             normal_llm.stop()
 
@@ -341,27 +360,34 @@ class TestTaskPredictorE2E:
             create_task_llm,
             get_initial_prompt,
         )
+        from dataset import SummEval
 
         limits = create_shared_limits()
         llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=limits)
 
         try:
+            summeval = SummEval(data_dir="./")
             prompt_template = get_initial_prompt(
-                dataset_name="SummEval",
+                dataset=summeval,
                 tasks=[FLUENCY_TASK],
             )
 
             samples = [
                 DatasetSample(
                     sample_id=f"e2e_s{i}",
-                    inputs={"summary": text, "source": "Test source document."},
+                    inputs={"machine_summary": text, "text": "Test source document."},
                     ground_truths={"fluency": gt},
                 )
-                for i, (text, gt) in enumerate([
-                    ("The cat sat on the mat. It was a good cat.", 4),
-                    ("cat mat sat good. very nice.", 2),
-                    ("The feline creature positioned itself upon the woven floor covering.", 5),
-                ])
+                for i, (text, gt) in enumerate(
+                    [
+                        ("The cat sat on the mat. It was a good cat.", 4),
+                        ("cat mat sat good. very nice.", 2),
+                        (
+                            "The feline creature positioned itself upon the woven floor covering.",
+                            5,
+                        ),
+                    ]
+                )
             ]
             batch = Batch(step=0, samples=samples)
 
@@ -377,7 +403,9 @@ class TestTaskPredictorE2E:
             for pred in predictions:
                 assert isinstance(pred, PredictionResult)
                 assert pred.raw_response is not None
-                print(f"  Sample {pred.sample_id}: outputs={pred.task_outputs}, raw={pred.raw_response[:80]!r}")
+                print(
+                    f"  Sample {pred.sample_id}: outputs={pred.task_outputs}, raw={pred.raw_response!r}"
+                )
 
             has_fluency = sum(1 for p in predictions if "fluency" in p.task_outputs)
             print(f"  {has_fluency}/{len(predictions)} predictions have fluency scores")
@@ -417,8 +445,12 @@ class TestSharedLimitsE2E:
             limits=[
                 ResourceLimit(key="parallel_calls", capacity=5),
                 CallLimit(window_seconds=60, capacity=cfg.max_rpm),
-                RateLimit(key="input_tokens", window_seconds=60, capacity=cfg.max_input_tpm),
-                RateLimit(key="output_tokens", window_seconds=60, capacity=cfg.max_output_tpm),
+                RateLimit(
+                    key="input_tokens", window_seconds=60, capacity=cfg.max_input_tpm
+                ),
+                RateLimit(
+                    key="output_tokens", window_seconds=60, capacity=cfg.max_output_tpm
+                ),
             ],
             mode="asyncio",
             shared=True,
@@ -465,10 +497,12 @@ class TestSharedLimitsE2E:
 
         try:
             future_a = worker_a.call_llm_batch(
-                prompts=["Say A."] * 5, verbosity=0,
+                prompts=["Say A."] * 5,
+                verbosity=0,
             )
             future_b = worker_b.call_llm_batch(
-                prompts=["Say B."] * 5, verbosity=0,
+                prompts=["Say B."] * 5,
+                verbosity=0,
             )
 
             results_a = future_a.result(timeout=90.0)
@@ -476,7 +510,9 @@ class TestSharedLimitsE2E:
 
             assert len(results_a) == 5
             assert len(results_b) == 5
-            print(f"Worker A: {len(results_a)} results, Worker B: {len(results_b)} results")
+            print(
+                f"Worker A: {len(results_a)} results, Worker B: {len(results_b)} results"
+            )
         finally:
             worker_a.stop()
             worker_b.stop()

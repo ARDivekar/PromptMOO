@@ -8,6 +8,7 @@ Provides:
 - Coroutine leak detection via sys.unraisablehook + gc.collect()
 - Pytest configuration (timeout, markers, pythonpath)
 """
+
 import gc
 import os
 import sys
@@ -29,9 +30,26 @@ if _env_path.exists():
 # ---------------------------------------------------------------------------
 # Pytest configuration
 # ---------------------------------------------------------------------------
+def pytest_addoption(parser):
+    """Register custom CLI options."""
+    parser.addoption(
+        "--algorithms",
+        action="store",
+        default=None,
+        help=(
+            "Comma-separated list of algorithms to run in E2E tests. "
+            "Example: --algorithms=opro,gpo  "
+            "Valid values: opro, gpo, textgrad. "
+            "Default (when omitted): run all algorithms."
+        ),
+    )
+
+
 def pytest_configure(config):
     """Register custom markers and set default timeout."""
-    config.addinivalue_line("markers", "integration: marks tests requiring real API calls (may cost money)")
+    config.addinivalue_line(
+        "markers", "integration: marks tests requiring real API calls (may cost money)"
+    )
     config.addinivalue_line("markers", "unit: marks pure unit tests (no network)")
     config.addinivalue_line("markers", "e2e: end-to-end tests with real LLM calls")
 
@@ -70,6 +88,7 @@ def api_key():
 def shared_limits():
     """Create shared LimitSet for LLM workers (fresh per test)."""
     from runner import create_shared_limits
+
     return create_shared_limits()
 
 
@@ -80,6 +99,7 @@ def task_llm(api_key, shared_limits):
     Yields the worker and stops it after the test.
     """
     from runner import create_task_llm
+
     llm = create_task_llm(llm="llama3.1", api_key=api_key, limits=shared_limits)
     yield llm
     llm.stop()
@@ -112,11 +132,13 @@ def _coroutine_leak_hook(unraisable):
     msg = str(unraisable.err_msg or "") + str(unraisable.object or "")
     if "coroutine" in msg and "was never awaited" in msg:
         with _coroutine_leak_lock:
-            _coroutine_leak_events.append({
-                "exc_type": unraisable.exc_type,
-                "message": msg,
-                "object": repr(unraisable.object),
-            })
+            _coroutine_leak_events.append(
+                {
+                    "exc_type": unraisable.exc_type,
+                    "message": msg,
+                    "object": repr(unraisable.object),
+                }
+            )
     sys.__unraisablehook__(unraisable)
 
 

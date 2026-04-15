@@ -1,10 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
 .env
+_env
+.venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
 .idea/
-morphic/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest
+.pytest_cache/
+
+# Outputs
+outputs/
+expt/outputs/
+
 __pycache__/*
 **/__pycache__/*
 .ipynb_checkpoints/*
 **/.ipynb_checkpoints/*
-expt/outputs/*
-expt/outputs_old/*
-outputs/
+tests/e2e_outputs/*
