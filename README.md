@@ -263,3 +263,16 @@ We suggest to run models through [OpenRouter](https://openrouter.ai/), which pro
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+## Citation
+
+If you use this framework in your research, please cite:
+
+```bibtex
+@software{promptmoo2026,
+  title={PromptMOO: A Framework for Multi-Objective Prompt Optimization with Observable Gradients},
+  author={Abhishek Divekar*, Parth Darshan*},
+  year={2026},
+  url={https://github.com/ARDivekar/PromptMOO}
+}
+```
